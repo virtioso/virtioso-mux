@@ -24,6 +24,7 @@ import json
 import os
 import pty
 import selectors
+import re
 import subprocess
 import sys
 import time
@@ -131,6 +132,9 @@ class ChannelRuntime:
             return
 
 
+_ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def _channel_runtimes(runtime_dir: Path, manifest: Manifest) -> list[ChannelRuntime]:
     channels_root = runtime_dir / "channels"
     channels_root.mkdir(parents=True, exist_ok=True)
@@ -195,6 +199,24 @@ def _decode_jsonl_frame(line: bytes) -> tuple[str, str, bytes]:
     return channel_name, direction, data
 
 
+def _strip_ansi_bytes(data: bytes) -> bytes:
+    return _ANSI_ESCAPE_RE.sub(b"", data)
+
+
+def _decode_prefixed_line(
+    line: bytes,
+    prefix_map: dict[str, str],
+    fallback_channel: str | None,
+) -> tuple[str | None, bytes]:
+    normalized = _strip_ansi_bytes(line)
+    for prefix, channel_name in prefix_map.items():
+        prefix_bytes = prefix.encode("utf-8")
+        if normalized.startswith(prefix_bytes):
+            payload = normalized[len(prefix_bytes):]
+            return channel_name, payload
+    return fallback_channel, normalized
+
+
 def _write_proc_input(stdin_fd: int | None, data: bytes) -> None:
     if stdin_fd is None or not data:
         return
@@ -217,6 +239,43 @@ def _register_input_sources(
         selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
     except Exception:
         pass
+
+
+def _flush_line_prefix_buffer(
+    buffer: bytearray,
+    *,
+    emit_partial: bool,
+    prefix_map: dict[str, str],
+    fallback_channel: str | None,
+    runtime_by_name: dict[str, ChannelRuntime],
+) -> None:
+    while True:
+        newline_idx = buffer.find(b"\n")
+        if newline_idx < 0:
+            break
+        line = bytes(buffer[:newline_idx + 1])
+        del buffer[:newline_idx + 1]
+        channel_name, payload = _decode_prefixed_line(line, prefix_map, fallback_channel)
+        if channel_name is None:
+            continue
+        runtime = runtime_by_name.get(channel_name)
+        if runtime is None:
+            raise ConsoleRouterError(f"line_prefixes referenced unknown channel {channel_name!r}")
+        runtime.append_raw(payload)
+        runtime.emit_event("rx", payload)
+        runtime.forward_to_pty(payload)
+    if emit_partial and buffer:
+        line = bytes(buffer)
+        buffer.clear()
+        channel_name, payload = _decode_prefixed_line(line, prefix_map, fallback_channel)
+        if channel_name is None:
+            return
+        runtime = runtime_by_name.get(channel_name)
+        if runtime is None:
+            raise ConsoleRouterError(f"line_prefixes referenced unknown channel {channel_name!r}")
+        runtime.append_raw(payload)
+        runtime.emit_event("rx", payload)
+        runtime.forward_to_pty(payload)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -372,9 +431,9 @@ def _set_nonblocking(fd: int) -> None:
 def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
     manifest = load_manifest(manifest_path)
     transport_type = manifest.transport.get("type")
-    if transport_type not in {"process_stdio", "jsonl_frames"}:
+    if transport_type not in {"process_stdio", "jsonl_frames", "line_prefixes"}:
         raise ConsoleRouterError(
-            "run-command currently supports only transport.type=process_stdio or jsonl_frames, "
+            "run-command currently supports only transport.type=process_stdio, jsonl_frames, or line_prefixes, "
             f"got {transport_type!r}"
         )
     if transport_type == "process_stdio" and len(manifest.channels) != 1:
@@ -385,17 +444,48 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
     primary_runtime: ChannelRuntime | None = None
     default_input_channel: str | None = None
     framed_out_buffer = bytearray()
+    line_prefix_buffer = bytearray()
+    line_prefix_map: dict[str, str] = {}
+    fallback_channel: str | None = None
 
     runtimes = _prepare_channel_runtimes(runtime_dir, manifest)
     runtime_by_name = _channel_runtime_map(runtimes)
     if transport_type == "process_stdio":
         primary_runtime = runtimes[0]
+    elif transport_type == "jsonl_frames":
+        default_input_channel = _require_transport_str(manifest.transport, "default_input_channel")
+        if default_input_channel not in runtime_by_name:
+            raise ConsoleRouterError(
+                f"transport default_input_channel {default_input_channel!r} does not match any manifest channel"
+            )
     else:
         default_input_channel = _require_transport_str(manifest.transport, "default_input_channel")
         if default_input_channel not in runtime_by_name:
             raise ConsoleRouterError(
                 f"transport default_input_channel {default_input_channel!r} does not match any manifest channel"
             )
+        prefix_map_raw = manifest.transport.get("prefix_map")
+        if not isinstance(prefix_map_raw, dict) or not prefix_map_raw:
+            raise ConsoleRouterError("line_prefixes transport requires a non-empty transport.prefix_map object")
+        for prefix, channel_name in prefix_map_raw.items():
+            if not isinstance(prefix, str) or not prefix:
+                raise ConsoleRouterError("line_prefixes prefix_map keys must be non-empty strings")
+            if not isinstance(channel_name, str) or not channel_name:
+                raise ConsoleRouterError("line_prefixes prefix_map values must be non-empty strings")
+            if channel_name not in runtime_by_name:
+                raise ConsoleRouterError(
+                    f"line_prefixes prefix_map references unknown channel {channel_name!r}"
+                )
+            line_prefix_map[prefix] = channel_name
+        fallback = manifest.transport.get("fallback_channel")
+        if fallback is not None:
+            if not isinstance(fallback, str) or not fallback:
+                raise ConsoleRouterError("line_prefixes fallback_channel must be a non-empty string when present")
+            if fallback not in runtime_by_name:
+                raise ConsoleRouterError(
+                    f"line_prefixes fallback_channel references unknown channel {fallback!r}"
+                )
+            fallback_channel = fallback
 
     proc = subprocess.Popen(
         command,
@@ -443,7 +533,7 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                             primary_runtime.append_raw(data)
                             primary_runtime.emit_event("rx", data)
                             primary_runtime.forward_to_pty(data)
-                        else:
+                        elif transport_type == "jsonl_frames":
                             framed_out_buffer.extend(data)
                             while True:
                                 newline_idx = framed_out_buffer.find(b"\n")
@@ -463,6 +553,16 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                                 runtime.emit_event(direction, frame_data)
                                 if direction == "rx":
                                     runtime.forward_to_pty(frame_data)
+                        else:
+                            os.write(sys.stdout.fileno(), data)
+                            line_prefix_buffer.extend(data)
+                            _flush_line_prefix_buffer(
+                                line_prefix_buffer,
+                                emit_partial=False,
+                                prefix_map=line_prefix_map,
+                                fallback_channel=fallback_channel,
+                                runtime_by_name=runtime_by_name,
+                            )
                     else:
                         selector.unregister(stdout_fd)
                 elif kind in {"pty_in", "stdin_in"}:
@@ -479,7 +579,7 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                             assert primary_runtime is not None
                             primary_runtime.emit_event("tx", data)
                             _write_proc_input(stdin_fd, data)
-                        else:
+                        elif transport_type == "jsonl_frames":
                             input_channel = payload or default_input_channel
                             runtime = runtime_by_name.get(str(input_channel)) if input_channel is not None else None
                             if runtime is None:
@@ -488,6 +588,15 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                                 )
                             runtime.emit_event("tx", data)
                             _write_proc_input(stdin_fd, _encode_jsonl_frame(runtime.channel.name, "tx", data))
+                        else:
+                            input_channel = payload or default_input_channel
+                            runtime = runtime_by_name.get(str(input_channel)) if input_channel is not None else None
+                            if runtime is None:
+                                raise ConsoleRouterError(
+                                    f"input referenced unknown channel {input_channel!r}"
+                                )
+                            runtime.emit_event("tx", data)
+                            _write_proc_input(stdin_fd, data)
                     elif not data:
                         try:
                             selector.unregister(read_fd)
@@ -508,11 +617,22 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                         primary_runtime.append_raw(trailing)
                         primary_runtime.emit_event("rx", trailing)
                         primary_runtime.forward_to_pty(trailing)
-                    else:
+                    elif transport_type == "jsonl_frames":
                         framed_out_buffer.extend(trailing)
+                    else:
+                        os.write(sys.stdout.fileno(), trailing)
+                        line_prefix_buffer.extend(trailing)
                 if transport_type == "jsonl_frames" and framed_out_buffer.strip():
                     raise ConsoleRouterError(
                         "jsonl_frames transport ended with an incomplete frame in the output buffer"
+                    )
+                if transport_type == "line_prefixes":
+                    _flush_line_prefix_buffer(
+                        line_prefix_buffer,
+                        emit_partial=True,
+                        prefix_map=line_prefix_map,
+                        fallback_channel=fallback_channel,
+                        runtime_by_name=runtime_by_name,
                     )
                 break
     finally:
