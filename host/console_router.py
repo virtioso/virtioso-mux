@@ -265,7 +265,13 @@ def _flush_line_prefix_buffer(
         runtime.emit_event("rx", payload)
         runtime.forward_to_pty(payload)
     if emit_partial and buffer:
-        line = bytes(buffer)
+        partial = bytes(buffer)
+        # Preserve prefixed VMM/control lines until newline so their classification
+        # stays stable. Flush unprefixed fallback traffic incrementally so prompts
+        # like "driver-vm login:" are visible without a trailing newline.
+        if any(partial.startswith(prefix.encode("utf-8")) for prefix in prefix_map):
+            return
+        line = partial
         buffer.clear()
         channel_name, payload = _decode_prefixed_line(line, prefix_map, fallback_channel)
         if channel_name is None:
