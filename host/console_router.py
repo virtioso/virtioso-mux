@@ -92,6 +92,10 @@ class ChannelRuntime:
             self.pty_link_path.symlink_to(self._pty_slave_path)
 
     @property
+    def pty_path(self) -> str | None:
+        return self._pty_slave_path
+
+    @property
     def pty_master_fd(self) -> int | None:
         return self._pty_master_fd
 
@@ -254,6 +258,27 @@ def prepare_runtime(manifest_path: Path, runtime_dir: Path) -> int:
     return 0
 
 
+def _write_sessions_manifest(runtime_dir: Path, runtimes: list[ChannelRuntime]) -> None:
+    sessions = []
+    for runtime in runtimes:
+        sessions.append(
+            {
+                "session_id": runtime.channel.name,
+                "name": runtime.channel.name,
+                "kind": runtime.channel.kind,
+                "interactive": runtime.channel.interactive,
+                "log_path": str(runtime.raw_log_path),
+                "events_path": str(runtime.events_log_path),
+                "pty_path": runtime.pty_path,
+            }
+        )
+    payload = {
+        "version": 1,
+        "sessions": sessions,
+    }
+    (runtime_dir / "sessions.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def describe_manifest(manifest_path: Path) -> int:
     manifest = load_manifest(manifest_path)
     payload = _runtime_manifest_payload(manifest)
@@ -281,6 +306,7 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
 
     channel_runtime = ChannelRuntime(channels_root / manifest.channels[0].name, manifest.channels[0])
     channel_runtime.prepare()
+    _write_sessions_manifest(runtime_dir, [channel_runtime])
 
     proc = subprocess.Popen(
         command,
