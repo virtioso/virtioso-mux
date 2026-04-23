@@ -131,6 +131,94 @@ class ChannelRuntime:
             return
 
 
+def _channel_runtimes(runtime_dir: Path, manifest: Manifest) -> list[ChannelRuntime]:
+    channels_root = runtime_dir / "channels"
+    channels_root.mkdir(parents=True, exist_ok=True)
+    return [ChannelRuntime(channels_root / channel.name, channel) for channel in manifest.channels]
+
+
+def _prepare_channel_runtimes(runtime_dir: Path, manifest: Manifest) -> list[ChannelRuntime]:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "runtime-manifest.json").write_text(json.dumps(_runtime_manifest_payload(manifest), indent=2) + "\n")
+    runtimes = _channel_runtimes(runtime_dir, manifest)
+    for runtime in runtimes:
+        runtime.prepare()
+    _write_sessions_manifest(runtime_dir, runtimes)
+    return runtimes
+
+
+def _close_channel_runtimes(runtimes: list[ChannelRuntime]) -> None:
+    for runtime in runtimes:
+        runtime.close()
+
+
+def _channel_runtime_map(runtimes: list[ChannelRuntime]) -> dict[str, ChannelRuntime]:
+    return {runtime.channel.name: runtime for runtime in runtimes}
+
+
+def _require_transport_str(transport: dict[str, Any], key: str) -> str:
+    value = transport.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConsoleRouterError(f"transport field '{key}' must be a non-empty string")
+    return value
+
+
+def _encode_jsonl_frame(channel_name: str, direction: str, data: bytes) -> bytes:
+    payload = {
+        "channel": channel_name,
+        "dir": direction,
+        "payload_b64": base64.b64encode(data).decode("ascii"),
+    }
+    return (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _decode_jsonl_frame(line: bytes) -> tuple[str, str, bytes]:
+    try:
+        payload = json.loads(line.decode("utf-8"))
+    except Exception as exc:
+        raise ConsoleRouterError(f"invalid jsonl frame: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConsoleRouterError("invalid jsonl frame: root must be object")
+    channel_name = payload.get("channel")
+    direction = payload.get("dir")
+    payload_b64 = payload.get("payload_b64")
+    if not isinstance(channel_name, str) or not channel_name:
+        raise ConsoleRouterError("invalid jsonl frame: missing channel")
+    if not isinstance(direction, str) or not direction:
+        raise ConsoleRouterError("invalid jsonl frame: missing dir")
+    if not isinstance(payload_b64, str):
+        raise ConsoleRouterError("invalid jsonl frame: missing payload_b64")
+    try:
+        data = base64.b64decode(payload_b64, validate=True)
+    except Exception as exc:
+        raise ConsoleRouterError(f"invalid jsonl frame payload: {exc}") from exc
+    return channel_name, direction, data
+
+
+def _write_proc_input(stdin_fd: int | None, data: bytes) -> None:
+    if stdin_fd is None or not data:
+        return
+    try:
+        os.write(stdin_fd, data)
+    except OSError:
+        return
+
+
+def _register_input_sources(
+    selector: selectors.BaseSelector,
+    runtimes: list[ChannelRuntime],
+) -> None:
+    for runtime in runtimes:
+        if runtime.pty_master_fd is None:
+            continue
+        _set_nonblocking(runtime.pty_master_fd)
+        selector.register(runtime.pty_master_fd, selectors.EVENT_READ, ("pty_in", runtime.channel.name))
+    try:
+        selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
+    except Exception:
+        pass
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
@@ -239,20 +327,11 @@ def _runtime_manifest_payload(manifest: Manifest) -> dict[str, Any]:
 
 def prepare_runtime(manifest_path: Path, runtime_dir: Path) -> int:
     manifest = load_manifest(manifest_path)
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    channels_root = runtime_dir / "channels"
-    channels_root.mkdir(parents=True, exist_ok=True)
-
-    runtime_manifest = _runtime_manifest_payload(manifest)
-    (runtime_dir / "runtime-manifest.json").write_text(json.dumps(runtime_manifest, indent=2) + "\n")
-
-    runtimes = [ChannelRuntime(channels_root / channel.name, channel) for channel in manifest.channels]
+    runtimes: list[ChannelRuntime] = []
     try:
-        for runtime in runtimes:
-            runtime.prepare()
+        runtimes = _prepare_channel_runtimes(runtime_dir, manifest)
     finally:
-        for runtime in runtimes:
-            runtime.close()
+        _close_channel_runtimes(runtimes)
 
     print(runtime_dir, flush=True)
     return 0
@@ -292,21 +371,31 @@ def _set_nonblocking(fd: int) -> None:
 
 def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
     manifest = load_manifest(manifest_path)
-    if manifest.transport.get("type") != "process_stdio":
+    transport_type = manifest.transport.get("type")
+    if transport_type not in {"process_stdio", "jsonl_frames"}:
         raise ConsoleRouterError(
-            f"run-command currently supports only transport.type=process_stdio, got {manifest.transport.get('type')!r}"
+            "run-command currently supports only transport.type=process_stdio or jsonl_frames, "
+            f"got {transport_type!r}"
         )
-    if len(manifest.channels) != 1:
-        raise ConsoleRouterError("run-command currently expects exactly one channel in the manifest")
+    if transport_type == "process_stdio" and len(manifest.channels) != 1:
+        raise ConsoleRouterError("run-command with process_stdio expects exactly one channel in the manifest")
 
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    channels_root = runtime_dir / "channels"
-    channels_root.mkdir(parents=True, exist_ok=True)
-    (runtime_dir / "runtime-manifest.json").write_text(json.dumps(_runtime_manifest_payload(manifest), indent=2) + "\n")
+    runtimes: list[ChannelRuntime] = []
+    runtime_by_name: dict[str, ChannelRuntime] = {}
+    primary_runtime: ChannelRuntime | None = None
+    default_input_channel: str | None = None
+    framed_out_buffer = bytearray()
 
-    channel_runtime = ChannelRuntime(channels_root / manifest.channels[0].name, manifest.channels[0])
-    channel_runtime.prepare()
-    _write_sessions_manifest(runtime_dir, [channel_runtime])
+    runtimes = _prepare_channel_runtimes(runtime_dir, manifest)
+    runtime_by_name = _channel_runtime_map(runtimes)
+    if transport_type == "process_stdio":
+        primary_runtime = runtimes[0]
+    else:
+        default_input_channel = _require_transport_str(manifest.transport, "default_input_channel")
+        if default_input_channel not in runtime_by_name:
+            raise ConsoleRouterError(
+                f"transport default_input_channel {default_input_channel!r} does not match any manifest channel"
+            )
 
     proc = subprocess.Popen(
         command,
@@ -331,20 +420,14 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
 
     selector = selectors.DefaultSelector()
     selector.register(stdout_fd, selectors.EVENT_READ, ("proc_out", None))
-    if channel_runtime.pty_master_fd is not None:
-        _set_nonblocking(channel_runtime.pty_master_fd)
-        selector.register(channel_runtime.pty_master_fd, selectors.EVENT_READ, ("pty_in", None))
-    try:
-        selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
-    except Exception:
-        pass
+    _register_input_sources(selector, runtimes)
 
     return_code = 0
     try:
         while True:
             events = selector.select(timeout=0.1)
             for key, _mask in events:
-                kind, _payload = key.data
+                kind, payload = key.data
                 if kind == "proc_out":
                     try:
                         data = os.read(stdout_fd, 4096)
@@ -354,10 +437,32 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                         else:
                             raise
                     if data:
-                        os.write(sys.stdout.fileno(), data)
-                        channel_runtime.append_raw(data)
-                        channel_runtime.emit_event("rx", data)
-                        channel_runtime.forward_to_pty(data)
+                        if transport_type == "process_stdio":
+                            assert primary_runtime is not None
+                            os.write(sys.stdout.fileno(), data)
+                            primary_runtime.append_raw(data)
+                            primary_runtime.emit_event("rx", data)
+                            primary_runtime.forward_to_pty(data)
+                        else:
+                            framed_out_buffer.extend(data)
+                            while True:
+                                newline_idx = framed_out_buffer.find(b"\n")
+                                if newline_idx < 0:
+                                    break
+                                line = bytes(framed_out_buffer[:newline_idx])
+                                del framed_out_buffer[:newline_idx + 1]
+                                if not line:
+                                    continue
+                                channel_name, direction, frame_data = _decode_jsonl_frame(line)
+                                runtime = runtime_by_name.get(channel_name)
+                                if runtime is None:
+                                    raise ConsoleRouterError(
+                                        f"jsonl frame referenced unknown channel {channel_name!r}"
+                                    )
+                                runtime.append_raw(frame_data)
+                                runtime.emit_event(direction, frame_data)
+                                if direction == "rx":
+                                    runtime.forward_to_pty(frame_data)
                     else:
                         selector.unregister(stdout_fd)
                 elif kind in {"pty_in", "stdin_in"}:
@@ -369,12 +474,20 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                             data = b""
                         else:
                             raise
-                    if data and stdin_fd is not None:
-                        channel_runtime.emit_event("tx", data)
-                        try:
-                            os.write(stdin_fd, data)
-                        except OSError:
-                            pass
+                    if data:
+                        if transport_type == "process_stdio":
+                            assert primary_runtime is not None
+                            primary_runtime.emit_event("tx", data)
+                            _write_proc_input(stdin_fd, data)
+                        else:
+                            input_channel = payload or default_input_channel
+                            runtime = runtime_by_name.get(str(input_channel)) if input_channel is not None else None
+                            if runtime is None:
+                                raise ConsoleRouterError(
+                                    f"input referenced unknown channel {input_channel!r}"
+                                )
+                            runtime.emit_event("tx", data)
+                            _write_proc_input(stdin_fd, _encode_jsonl_frame(runtime.channel.name, "tx", data))
                     elif not data:
                         try:
                             selector.unregister(read_fd)
@@ -389,14 +502,22 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                 except OSError:
                     trailing = b""
                 if trailing:
-                    os.write(sys.stdout.fileno(), trailing)
-                    channel_runtime.append_raw(trailing)
-                    channel_runtime.emit_event("rx", trailing)
-                    channel_runtime.forward_to_pty(trailing)
+                    if transport_type == "process_stdio":
+                        assert primary_runtime is not None
+                        os.write(sys.stdout.fileno(), trailing)
+                        primary_runtime.append_raw(trailing)
+                        primary_runtime.emit_event("rx", trailing)
+                        primary_runtime.forward_to_pty(trailing)
+                    else:
+                        framed_out_buffer.extend(trailing)
+                if transport_type == "jsonl_frames" and framed_out_buffer.strip():
+                    raise ConsoleRouterError(
+                        "jsonl_frames transport ended with an incomplete frame in the output buffer"
+                    )
                 break
     finally:
         selector.close()
-        channel_runtime.close()
+        _close_channel_runtimes(runtimes)
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=5)
