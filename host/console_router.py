@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Manifest-driven console router runtime preparer.
+"""Manifest-driven console router.
 
-This tool is the backend-owned seam for console routing metadata. The initial
-slice validates a launcher-provided manifest and prepares a stable runtime
-layout for channels. Later slices can extend this same tool into a live router
-that owns PTYs, byte forwarding, and event capture.
+The initial live slice supports the current launcher-owned merged-console
+topology by:
+
+- validating a launcher-provided manifest
+- preparing a stable runtime layout
+- spawning a wrapped command
+- mirroring command stdout/stderr to:
+  - router stdout for compatibility
+  - per-channel raw log
+  - per-channel event log
+  - an optional PTY for interactive attachment
+- forwarding input from PTY and stdin back to the wrapped command
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import errno
 import json
+import os
+import pty
+import selectors
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +54,77 @@ class Manifest:
     binary_name: str
     transport: dict[str, Any]
     channels: list[Channel]
+
+
+class ChannelRuntime:
+    def __init__(self, root: Path, channel: Channel):
+        self.channel = channel
+        self.root = root
+        self.raw_log_path = root / "raw.log"
+        self.events_log_path = root / "events.jsonl"
+        self.pty_link_path = root / "pty"
+        self._seq = 0
+        self._pty_master_fd: int | None = None
+        self._pty_slave_path: str | None = None
+
+    def prepare(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "id": self.channel.id,
+            "name": self.channel.name,
+            "kind": self.channel.kind,
+            "interactive": self.channel.interactive,
+            "pty": self.channel.pty,
+            "raw_log": "raw.log",
+            "events_log": "events.jsonl",
+            **self.channel.extras,
+        }
+        (self.root / "channel.json").write_text(json.dumps(payload, indent=2) + "\n")
+        self.raw_log_path.touch()
+        self.events_log_path.touch()
+        if self.channel.pty:
+            master_fd, slave_fd = pty.openpty()
+            self._pty_master_fd = master_fd
+            self._pty_slave_path = os.ttyname(slave_fd)
+            os.close(slave_fd)
+            if self.pty_link_path.exists() or self.pty_link_path.is_symlink():
+                self.pty_link_path.unlink()
+            self.pty_link_path.symlink_to(self._pty_slave_path)
+
+    @property
+    def pty_master_fd(self) -> int | None:
+        return self._pty_master_fd
+
+    def close(self) -> None:
+        if self._pty_master_fd is not None:
+            os.close(self._pty_master_fd)
+            self._pty_master_fd = None
+
+    def emit_event(self, direction: str, data: bytes) -> None:
+        self._seq += 1
+        event = {
+            "source": self.channel.name,
+            "dir": direction,
+            "seq": self._seq,
+            "clock_monotonic_ns": time.monotonic_ns(),
+            "clock_realtime_ns": time.time_ns(),
+            "payload_b64": base64.b64encode(data).decode("ascii"),
+            "payload_len": len(data),
+        }
+        with open(self.events_log_path, "a", encoding="utf-8", buffering=1) as f:
+            f.write(json.dumps(event) + "\n")
+
+    def append_raw(self, data: bytes) -> None:
+        with open(self.raw_log_path, "ab", buffering=0) as f:
+            f.write(data)
+
+    def forward_to_pty(self, data: bytes) -> None:
+        if self._pty_master_fd is None:
+            return
+        try:
+            os.write(self._pty_master_fd, data)
+        except OSError:
+            return
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -98,15 +184,19 @@ def load_manifest(path: Path) -> Manifest:
         name = _require_str(entry, "name")
         kind = _require_str(entry, "kind")
         interactive = _require_bool(entry, "interactive")
-        pty = _require_bool(entry, "pty")
+        pty_enabled = _require_bool(entry, "pty")
         if channel_id in seen_ids:
             raise ConsoleRouterError(f"duplicate channel id: {channel_id}")
         if name in seen_names:
             raise ConsoleRouterError(f"duplicate channel name: {name}")
         seen_ids.add(channel_id)
         seen_names.add(name)
-        extras = {k: v for k, v in entry.items() if k not in {"id", "name", "kind", "interactive", "pty"}}
-        channels.append(Channel(channel_id, name, kind, interactive, pty, extras))
+        extras = {
+            k: v
+            for k, v in entry.items()
+            if k not in {"id", "name", "kind", "interactive", "pty"}
+        }
+        channels.append(Channel(channel_id, name, kind, interactive, pty_enabled, extras))
 
     return Manifest(
         version=version,
@@ -135,6 +225,7 @@ def _runtime_manifest_payload(manifest: Manifest) -> dict[str, Any]:
                 "runtime_dir": f"channels/{channel.name}",
                 "raw_log": f"channels/{channel.name}/raw.log",
                 "events_log": f"channels/{channel.name}/events.jsonl",
+                "pty_link": f"channels/{channel.name}/pty" if channel.pty else None,
                 **channel.extras,
             }
             for channel in manifest.channels
@@ -151,22 +242,13 @@ def prepare_runtime(manifest_path: Path, runtime_dir: Path) -> int:
     runtime_manifest = _runtime_manifest_payload(manifest)
     (runtime_dir / "runtime-manifest.json").write_text(json.dumps(runtime_manifest, indent=2) + "\n")
 
-    for channel in manifest.channels:
-        channel_dir = channels_root / channel.name
-        channel_dir.mkdir(parents=True, exist_ok=True)
-        channel_payload = {
-            "id": channel.id,
-            "name": channel.name,
-            "kind": channel.kind,
-            "interactive": channel.interactive,
-            "pty": channel.pty,
-            "raw_log": "raw.log",
-            "events_log": "events.jsonl",
-            **channel.extras,
-        }
-        (channel_dir / "channel.json").write_text(json.dumps(channel_payload, indent=2) + "\n")
-        (channel_dir / "raw.log").touch()
-        (channel_dir / "events.jsonl").touch()
+    runtimes = [ChannelRuntime(channels_root / channel.name, channel) for channel in manifest.channels]
+    try:
+        for runtime in runtimes:
+            runtime.prepare()
+    finally:
+        for runtime in runtimes:
+            runtime.close()
 
     print(runtime_dir, flush=True)
     return 0
@@ -177,6 +259,123 @@ def describe_manifest(manifest_path: Path) -> int:
     payload = _runtime_manifest_payload(manifest)
     print(json.dumps(payload, indent=2), flush=True)
     return 0
+
+
+def _set_nonblocking(fd: int) -> None:
+    os.set_blocking(fd, False)
+
+
+def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
+    manifest = load_manifest(manifest_path)
+    if manifest.transport.get("type") != "process_stdio":
+        raise ConsoleRouterError(
+            f"run-command currently supports only transport.type=process_stdio, got {manifest.transport.get('type')!r}"
+        )
+    if len(manifest.channels) != 1:
+        raise ConsoleRouterError("run-command currently expects exactly one channel in the manifest")
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    channels_root = runtime_dir / "channels"
+    channels_root.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "runtime-manifest.json").write_text(json.dumps(_runtime_manifest_payload(manifest), indent=2) + "\n")
+
+    channel_runtime = ChannelRuntime(channels_root / manifest.channels[0].name, manifest.channels[0])
+    channel_runtime.prepare()
+
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        start_new_session=True,
+    )
+    if proc.stdout is None:
+        raise ConsoleRouterError("wrapped command stdout unavailable")
+
+    stdout_fd = proc.stdout.fileno()
+    stdin_fd = proc.stdin.fileno() if proc.stdin is not None else None
+    _set_nonblocking(stdout_fd)
+    if stdin_fd is not None:
+        _set_nonblocking(stdin_fd)
+    try:
+        _set_nonblocking(sys.stdin.fileno())
+    except OSError:
+        pass
+
+    selector = selectors.DefaultSelector()
+    selector.register(stdout_fd, selectors.EVENT_READ, ("proc_out", None))
+    if channel_runtime.pty_master_fd is not None:
+        _set_nonblocking(channel_runtime.pty_master_fd)
+        selector.register(channel_runtime.pty_master_fd, selectors.EVENT_READ, ("pty_in", None))
+    try:
+        selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
+    except Exception:
+        pass
+
+    return_code = 0
+    try:
+        while True:
+            events = selector.select(timeout=0.1)
+            for key, _mask in events:
+                kind, _payload = key.data
+                if kind == "proc_out":
+                    try:
+                        data = os.read(stdout_fd, 4096)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            data = b""
+                        else:
+                            raise
+                    if data:
+                        os.write(sys.stdout.fileno(), data)
+                        channel_runtime.append_raw(data)
+                        channel_runtime.emit_event("rx", data)
+                        channel_runtime.forward_to_pty(data)
+                    else:
+                        selector.unregister(stdout_fd)
+                elif kind in {"pty_in", "stdin_in"}:
+                    read_fd = key.fd
+                    try:
+                        data = os.read(read_fd, 4096)
+                    except OSError as exc:
+                        if exc.errno in {errno.EIO, errno.EBADF}:
+                            data = b""
+                        else:
+                            raise
+                    if data and stdin_fd is not None:
+                        channel_runtime.emit_event("tx", data)
+                        try:
+                            os.write(stdin_fd, data)
+                        except OSError:
+                            pass
+                    elif not data:
+                        try:
+                            selector.unregister(read_fd)
+                        except Exception:
+                            pass
+
+            polled = proc.poll()
+            if polled is not None:
+                return_code = polled
+                try:
+                    trailing = os.read(stdout_fd, 4096)
+                except OSError:
+                    trailing = b""
+                if trailing:
+                    os.write(sys.stdout.fileno(), trailing)
+                    channel_runtime.append_raw(trailing)
+                    channel_runtime.emit_event("rx", trailing)
+                    channel_runtime.forward_to_pty(trailing)
+                break
+    finally:
+        selector.close()
+        channel_runtime.close()
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    return return_code
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +391,12 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--runtime-dir", required=True, help="Directory for channel runtime state")
     prepare.set_defaults(handler="prepare_runtime")
 
+    run = sub.add_parser("run-command", help="Run a command through the current manifest-driven router")
+    run.add_argument("--manifest", required=True, help="Path to console-manifest.json")
+    run.add_argument("--runtime-dir", required=True, help="Directory for router runtime state")
+    run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run after '--'")
+    run.set_defaults(handler="run_command")
+
     return parser.parse_args()
 
 
@@ -204,6 +409,17 @@ def main() -> int:
             return prepare_runtime(
                 Path(args.manifest).expanduser().resolve(),
                 Path(args.runtime_dir).expanduser().resolve(),
+            )
+        if args.handler == "run_command":
+            command = list(args.cmd)
+            if command and command[0] == "--":
+                command = command[1:]
+            if not command:
+                raise ConsoleRouterError("run-command requires a non-empty command after '--'")
+            return run_command(
+                Path(args.manifest).expanduser().resolve(),
+                Path(args.runtime_dir).expanduser().resolve(),
+                command,
             )
         raise ConsoleRouterError(f"unhandled command: {args.handler}")
     except ConsoleRouterError as exc:
