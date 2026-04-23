@@ -66,6 +66,7 @@ class ChannelRuntime:
         self.pty_link_path = root / "pty"
         self._seq = 0
         self._pty_master_fd: int | None = None
+        self._pty_slave_fd: int | None = None
         self._pty_slave_path: str | None = None
 
     def prepare(self) -> None:
@@ -86,8 +87,8 @@ class ChannelRuntime:
         if self.channel.pty:
             master_fd, slave_fd = pty.openpty()
             self._pty_master_fd = master_fd
+            self._pty_slave_fd = slave_fd
             self._pty_slave_path = os.ttyname(slave_fd)
-            os.close(slave_fd)
             if self.pty_link_path.exists() or self.pty_link_path.is_symlink():
                 self.pty_link_path.unlink()
             self.pty_link_path.symlink_to(self._pty_slave_path)
@@ -104,6 +105,9 @@ class ChannelRuntime:
         if self._pty_master_fd is not None:
             os.close(self._pty_master_fd)
             self._pty_master_fd = None
+        if self._pty_slave_fd is not None:
+            os.close(self._pty_slave_fd)
+            self._pty_slave_fd = None
 
     def emit_event(self, direction: str, data: bytes) -> None:
         self._seq += 1
