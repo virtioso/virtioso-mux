@@ -27,7 +27,9 @@ import selectors
 import re
 import subprocess
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +88,10 @@ class ChannelRuntime:
         self.events_log_path.touch()
         if self.channel.pty:
             master_fd, slave_fd = pty.openpty()
+            tty.setraw(slave_fd)
+            attrs = termios.tcgetattr(slave_fd)
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG | termios.IEXTEN)
+            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
             self._pty_master_fd = master_fd
             self._pty_slave_fd = slave_fd
             self._pty_slave_path = os.ttyname(slave_fd)
