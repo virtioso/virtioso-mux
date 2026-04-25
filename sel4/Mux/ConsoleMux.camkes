@@ -1,0 +1,15 @@
+/*
+ * Copyright 2026, Unikie
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import <PutChar.idl4>;
+import "interfaces/ConsoleMuxEmit.idl4";
+
+component ConsoleMux {
+    control;
+
+    provides ConsoleMuxEmit mux_emit;
+    uses PutChar uplink;
+}

@@ -1,0 +1,17 @@
+/*
+ * Copyright 2026, Unikie
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import <PutChar.idl4>;
+import "../ConsoleMux/interfaces/ConsoleMuxEmit.idl4";
+
+component GuestConsoleSink {
+    control;
+
+    attribute int stream_id = 0;
+
+    provides PutChar guest_putchar;
+    uses ConsoleMuxEmit mux_emit;
+}
