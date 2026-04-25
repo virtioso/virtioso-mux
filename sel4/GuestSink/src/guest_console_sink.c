@@ -14,7 +14,7 @@
 #define CONSOLE_FRAME_VERSION 1
 #define CONSOLE_FRAME_DIRECTION_RX 1
 #define CONSOLE_FRAME_FLAGS 0
-#define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 256
+#define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
 
 typedef struct guest_console_sink_batch_buffer {
     uint32_t head;
@@ -25,6 +25,11 @@ typedef struct guest_console_sink_batch_buffer {
 static guest_console_sink_batch_buffer_t *guest_console_sink_buffer(void)
 {
     return (guest_console_sink_batch_buffer_t *)mux_batch_get_buf();
+}
+
+static int guest_console_sink_is_interactive_prompt_stream(uint8_t framed_stream_id)
+{
+    return framed_stream_id == 1 || framed_stream_id == 5;
 }
 
 static void guest_console_sink_reset(guest_console_sink_batch_buffer_t *batch)
@@ -91,7 +96,8 @@ static void guest_console_sink_emit_frame_byte(uint8_t framed_stream_id, uint8_t
         }
     }
 
-    if (byte == '\n' || byte == '\r' || byte == ':' ||
+    if (byte == '\n' || byte == '\r' ||
+        (byte == ':' && guest_console_sink_is_interactive_prompt_stream(framed_stream_id)) ||
         batch->tail >= GUEST_CONSOLE_SINK_FLUSH_THRESHOLD) {
         guest_console_sink_flush(batch);
     }
