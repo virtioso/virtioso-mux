@@ -8,8 +8,6 @@ import <PutChar.idl4>;
 import <ConsoleMuxEmit.idl4>;
 
 component ConsoleMux {
-    control;
-
     provides ConsoleMuxEmit mux_emit;
     uses PutChar uplink;
 }

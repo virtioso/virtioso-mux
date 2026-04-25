@@ -13,11 +13,3 @@ void guest_putchar_putchar(int c)
     }
     mux_emit_emit(stream_id, c);
 }
-
-int run(void)
-{
-    while (1) {
-        seL4_Yield();
-    }
-    return 0;
-}
