@@ -70,9 +70,14 @@ static void console_sink_report_rpc_stats(void)
 
 static void sink_putchar(int c)
 {
+#ifdef CONSOLE_SINK_DROP_OUTPUT
+    (void)c;
+    return;
+#else
     if (serial != NULL) {
         ps_cdev_putchar(serial, c);
     }
+#endif
 }
 
 void pre_init(void)
