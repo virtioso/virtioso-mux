@@ -5,7 +5,7 @@
  */
 
 import <PutChar.idl4>;
-import "interfaces/ConsoleMuxEmit.idl4";
+import <ConsoleMuxEmit.idl4>;
 
 component ConsoleMux {
     control;
