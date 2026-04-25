@@ -9,8 +9,6 @@
 
 #include <camkes.h>
 #include <platsupport/arch/tsc.h>
-
-static volatile int console_mux_emit_lock;
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
 #define CONSOLE_FRAME_MAGIC_0 'C'
 #define CONSOLE_FRAME_MAGIC_1 'F'
@@ -117,18 +115,6 @@ static void console_mux_report_rpc_stats(void)
     }
 }
 
-static void console_mux_lock(void)
-{
-    while (__atomic_test_and_set(&console_mux_emit_lock, __ATOMIC_ACQUIRE)) {
-        seL4_Yield();
-    }
-}
-
-static void console_mux_unlock(void)
-{
-    __atomic_clear(&console_mux_emit_lock, __ATOMIC_RELEASE);
-}
-
 void *mux_batch_buf(seL4_Word client_id) WEAK;
 seL4_Word mux_batch_get_sender_id(void) WEAK;
 
@@ -153,9 +139,7 @@ void mux_batch_batch(void)
     }
 
     start = console_mux_cycles_now();
-    console_mux_lock();
     console_mux_uplink_bytes(&batch->buf[batch->head], bytes_len);
-    console_mux_unlock();
     console_mux_rpc_stats.server_calls++;
     console_mux_rpc_stats.server_payload_bytes += bytes_len;
     console_mux_rpc_stats.server_cycles += console_mux_cycles_now() - start;
