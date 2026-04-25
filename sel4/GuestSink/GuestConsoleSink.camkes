@@ -5,11 +5,11 @@
  */
 
 import <PutChar.idl4>;
-import <ConsoleMuxEmit.idl4>;
+import <Batch.idl4>;
 
 component GuestConsoleSink {
     attribute int stream_id = 0;
 
     provides PutChar guest_putchar;
-    uses ConsoleMuxEmit mux_emit;
+    uses Batch mux_batch;
 }
