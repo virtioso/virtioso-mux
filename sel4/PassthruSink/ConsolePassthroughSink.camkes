@@ -6,12 +6,14 @@
 
 import <GetChar.idl4>;
 import <PutChar.idl4>;
+import <Batch.idl4>;
 import <serial.camkes>;
 
 component ConsolePassthroughSink {
     control;
     provides PutChar processed_putchar;
     provides PutChar raw_putchar;
+    provides Batch raw_batch;
     provides GetChar getchar;
 
     uses IOPort serial_port;

@@ -5,6 +5,7 @@
  */
 
 #include <assert.h>
+#include <stdint.h>
 
 #include <camkes.h>
 #include <camkes/io.h>
@@ -14,6 +15,12 @@
 static ps_io_ops_t io_ops;
 static struct ps_chardevice serial_device;
 static struct ps_chardevice *serial = NULL;
+
+typedef struct console_sink_batch_buffer {
+    uint32_t head;
+    uint32_t tail;
+    char buf[4096 - 8];
+} console_sink_batch_buffer_t;
 
 static void sink_putchar(int c)
 {
@@ -42,6 +49,24 @@ void processed_putchar_putchar(int c)
 void raw_putchar_putchar(int c)
 {
     sink_putchar(c);
+}
+
+seL4_Word raw_batch_get_sender_id(void) WEAK;
+void *raw_batch_buf(seL4_Word client_id) WEAK;
+
+void raw_batch_batch(void)
+{
+    console_sink_batch_buffer_t *batch =
+        (console_sink_batch_buffer_t *)raw_batch_buf(raw_batch_get_sender_id());
+
+    if (batch == NULL) {
+        return;
+    }
+
+    while (batch->head != batch->tail) {
+        sink_putchar((unsigned char)batch->buf[batch->head]);
+        batch->head = (batch->head + 1) % sizeof(batch->buf);
+    }
 }
 
 void getchar_foo(void)

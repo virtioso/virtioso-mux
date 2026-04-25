@@ -5,9 +5,10 @@
  */
 
 import <PutChar.idl4>;
+import <Batch.idl4>;
 import <ConsoleMuxEmit.idl4>;
 
 component ConsoleMux {
     provides ConsoleMuxEmit mux_emit;
-    uses PutChar uplink;
+    uses Batch uplink_batch;
 }
