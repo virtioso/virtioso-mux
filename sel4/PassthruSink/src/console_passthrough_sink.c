@@ -17,7 +17,7 @@
 
 #define CONSOLE_SINK_RPC_REPORT_INTERVAL 16
 #ifndef CONSOLE_SINK_RPC_REPORTS
-#define CONSOLE_SINK_RPC_REPORTS 1
+#define CONSOLE_SINK_RPC_REPORTS 0
 #endif
 
 static ps_io_ops_t io_ops;
