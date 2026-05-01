@@ -83,16 +83,19 @@ Verified implementation pieces:
 - [`tools/qemu_runner.py`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/tools/qemu_runner.py:593)
   declares the logical stream IDs used by the host runtime.
 - [`apps/x86/vm_qemu_virtio/vm_qemu_virtio.camkes`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/apps/x86/vm_qemu_virtio/vm_qemu_virtio.camkes:88)
-  hard-codes current target-side stream IDs: VM0 console `1`, VM1 console `5`,
-  and VMM/infra diagnostics `3`.
+  previously hard-coded target-side stream IDs for VM0 console, VM1 console,
+  and VMM/infra diagnostics. These app assignments are now migration history,
+  not the target contract.
 - [`components/GuestConsoleSink/src/guest_console_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/GuestConsoleSink/src/guest_console_sink.c:68)
-  currently wraps each payload byte in `CF` binary-frame records and flushes on
-  newline, carriage return, prompt colon, or threshold.
+  currently wraps each payload byte in `CF` binary-frame records, but now gets
+  the stream ID from generated CAmkES identity and flushes on newline, carriage
+  return, prompt colon, or threshold.
 - [`components/ConsolePassthroughSink/src/console_passthrough_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsolePassthroughSink/src/console_passthrough_sink.c:111)
   is the raw batch-to-physical-serial sink.
 - [`components/ConsoleMux/src/console_mux.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsoleMux/src/console_mux.c:42)
   exists in the minimal x86 path and forwards batched bytes to an uplink, but
-  still emits profiling as `CF` frames.
+  its optional report path now uses generated CAmkES identity and suppresses
+  reports when the mux itself has no valid stream.
 - [`tools/console_router.py`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/tools/console_router.py:122)
   contains the current `CF` binary-frame decode path and the compatibility
   `line_prefixes` classifier.
@@ -465,7 +468,56 @@ output-only. Keep UARTI passthrough as the Orin VM1 interactive/proof console
 until the guest UART model supports RX, status, and interrupt behavior well
 enough for normal Linux console operation.
 
-### 10. Preserve Platform-Specific Physical UART Policy
+### 10. Add UART-Like TX Buffering At Guest-Facing Sinks
+
+Rationale:
+Guest-facing UART sinks should behave more like a 16450/16550-style UART
+transmit path than like one CAmkES RPC per byte. The guest can still write
+characters one at a time, but the VMM-side sink should coalesce them before
+calling the mux/uplink path. This keeps the guest-visible model simple while
+reducing CAmkES RPC pressure on the muxer and physical UART backend.
+
+Buffering policy:
+
+- each guest-facing UART sink owns a per-stream TX staging buffer
+- newline or carriage return flushes the staged bytes immediately
+- a full staging buffer flushes immediately
+- on the first byte of a non-empty buffer, schedule a delayed flush; use a
+  configurable timeout, with `50 ms` as the initial default
+- if more guest bytes arrive before the delayed flush fires, keep appending
+  until newline, carriage return, or capacity triggers an earlier flush
+- when the delayed flush fires, send whatever is staged even if no newline has
+  arrived
+- after scheduling the delayed flush, return from the guest write path so the
+  VMM can continue/yield instead of blocking for a synchronous UART drain
+- the flush path sends one batch to the muxer/real UART backend for that
+  component stream
+
+Affected areas:
+
+- `components/GuestConsoleSink/src/guest_console_sink.c`
+- the future Arm PL011 or selected guest UART model
+- `projects/vm/components/Init/src/serial.c` and related guest UART emulation
+  paths where x86 guest writes enter the console stream
+- timer integration in the VMM or sink component; the existing `Init` timer
+  path is a useful reference, but the final owner should be the guest-facing
+  UART sink/model, not the mux core
+- `Batch` or `seL4SerialServer` connectors only as transport mechanisms; they
+  should not define buffering semantics themselves
+
+Short-term benefit:
+The muxer sees larger, line-oriented or timeout-oriented writes instead of a
+stream of tiny RPCs. This should reduce overhead while preserving interactive
+console behavior for prompts and partial lines.
+
+Migration implication:
+Do not push this policy into the host demuxer or physical UART backend. The
+backend should receive already-coalesced bytes for a selected stream. The mux
+core can stay small: stream switch, byte escaping, introspection, and UART
+backend IO. Buffering belongs at the producer side where guest UART semantics
+are known.
+
+### 11. Preserve Platform-Specific Physical UART Policy
 
 Rationale:
 x86 QEMU can use a dedicated second serial/chardev uplink. Orin has real TCU,
@@ -489,7 +541,7 @@ The Orin target should eventually choose one of two explicit modes:
 `physical-uarti-console` for direct VM1 hardware console, or
 `muxed-pl011-console` for VM1 VMM-emulated output. Do not blend them silently.
 
-### 11. Require Clean Repos, `before-mux` Branches, And Frequent Commits
+### 12. Require Clean Repos, `before-mux` Branches, And Frequent Commits
 
 Rationale:
 This change crosses multiple repos and intentionally rewrites local mux/demux
@@ -570,7 +622,10 @@ introspection exists.
    than from a Python table.
 4. Confirm VM0 login/shell automation uses the introspected driver-VM console
    alias or component name, not `tty0`.
-5. Confirm no hard-coded stream IDs remain in target, demux, or Autopilot code.
+5. Confirm guest-facing sinks coalesce output: newline flushes immediately,
+   partial lines flush after the configured timeout, and byte-at-a-time guest
+   writes do not cause byte-at-a-time mux/uplink RPCs.
+6. Confirm no hard-coded stream IDs remain in target, demux, or Autopilot code.
 
 ### Phase 5: Hardware UART Backend Proof
 
@@ -595,11 +650,14 @@ introspection exists.
    selected guest UART model to Linux, route guest TX into an introspected
    demuxed channel, inject RX from the demux/input side, and prove normal Linux
    console interaction rather than only earlycon output.
-5. Confirm the same guest UART model contract can be backed by QEMU when the VM
+5. Confirm the Arm guest UART TX path uses the same producer-side buffering
+   policy: newline flush, capacity flush, and a configurable delayed flush with
+   `50 ms` as the starting default.
+6. Confirm the same guest UART model contract can be backed by QEMU when the VM
    is run outside the seL4 VMM path.
-6. Prove Autopilot consumes logical channel introspection rather than
+7. Prove Autopilot consumes logical channel introspection rather than
    hard-coded `tty0`/`tty1` stream assumptions.
-7. Only after that, evaluate whether UARTI remains useful as a separate
+8. Only after that, evaluate whether UARTI remains useful as a separate
    physical console or can be replaced by the muxed guest UART path.
 
 ### Phase 7: Kconfig Off-Mode Proof
@@ -622,6 +680,13 @@ introspection exists.
 - The PL011 emulator cannot currently receive guest input. A muxed PL011 output
   proof is not enough; the target is a bidirectional Linux console device model
   with TX, RX, status, and interrupt behavior.
+- Guest-facing UART buffering needs a timer owner. If the delayed flush is
+  bolted onto the mux core, the mux will learn guest-device policy and become
+  harder to reuse across hardware UART backends. Keep the timeout and line
+  buffering at the UART sink/device-model boundary.
+- A `50 ms` delayed flush is only the initial default. It must be configurable,
+  and validation should check both throughput-oriented bursts and interactive
+  prompts so the timeout does not hide shell responsiveness problems.
 - Orin TCU depends on HSP/BPMP behavior. Historical TCU hangs mean the plan
   should avoid making TCU the only visibility path for early VM1 progress.
 - Hardware UART backend scope must be kept separate from the mux core. Arm
