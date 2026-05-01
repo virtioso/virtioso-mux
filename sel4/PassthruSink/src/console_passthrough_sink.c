@@ -16,6 +16,9 @@
 #include <sel4/sel4.h>
 
 #define CONSOLE_SINK_RPC_REPORT_INTERVAL 16
+#ifndef CONSOLE_SINK_RPC_REPORTS
+#define CONSOLE_SINK_RPC_REPORTS 1
+#endif
 
 static ps_io_ops_t io_ops;
 static struct ps_chardevice serial_device;
@@ -127,9 +130,11 @@ void raw_batch_batch(void)
         console_sink_rpc_stats.server_calls++;
         console_sink_rpc_stats.server_payload_bytes += payload_bytes;
         console_sink_rpc_stats.server_cycles += console_sink_cycles_now() - start;
+#if CONSOLE_SINK_RPC_REPORTS
         if ((console_sink_rpc_stats.server_calls % CONSOLE_SINK_RPC_REPORT_INTERVAL) == 0) {
             console_sink_report_rpc_stats();
         }
+#endif
     }
 }
 

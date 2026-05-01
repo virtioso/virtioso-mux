@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <camkes.h>
+#include <sel4/sel4.h>
 #include <platsupport/arch/tsc.h>
 
 #define CONSOLE_FRAME_MAGIC_0 'C'
@@ -18,7 +19,14 @@
 #define CONSOLE_FRAME_FLAGS 0
 #define CONSOLE_FRAME_STREAM_VMM_DEBUG 7
 #define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
+#ifndef GUEST_CONSOLE_SINK_RPC_REPORTS
+#define GUEST_CONSOLE_SINK_RPC_REPORTS 1
+#endif
+#ifdef GUEST_CONSOLE_SINK_DEBUGPUTCHAR_REPORTS
+#define GUEST_CONSOLE_SINK_RPC_REPORT_INTERVAL 1
+#else
 #define GUEST_CONSOLE_SINK_RPC_REPORT_INTERVAL 16
+#endif
 
 typedef struct guest_console_sink_batch_buffer {
     uint32_t head;
@@ -33,6 +41,7 @@ typedef struct guest_console_sink_rpc_stats {
 } guest_console_sink_rpc_stats_t;
 
 static guest_console_sink_rpc_stats_t guest_console_sink_rpc_stats;
+static int guest_console_sink_debug_marked;
 
 static inline uint64_t guest_console_sink_cycles_now(void)
 {
@@ -102,10 +111,17 @@ static void guest_console_sink_append_frame(
 
 static void guest_console_sink_emit_report_line(guest_console_sink_batch_buffer_t *batch, const char *line)
 {
+#ifdef GUEST_CONSOLE_SINK_DEBUGPUTCHAR_REPORTS
+    (void)batch;
+    while (*line != '\0') {
+        seL4_DebugPutChar(*line++);
+    }
+#else
     while (*line != '\0') {
         guest_console_sink_append_frame(batch, CONSOLE_FRAME_STREAM_VMM_DEBUG, (uint8_t)*line++);
     }
     guest_console_sink_flush(batch);
+#endif
 }
 
 static void guest_console_sink_report_rpc_stats(guest_console_sink_batch_buffer_t *batch)
@@ -150,9 +166,11 @@ static void guest_console_sink_flush(guest_console_sink_batch_buffer_t *batch)
     guest_console_sink_rpc_stats.batch_calls++;
     guest_console_sink_rpc_stats.batch_payload_bytes += payload_bytes;
     guest_console_sink_rpc_stats.batch_cycles += guest_console_sink_cycles_now() - start;
+#if GUEST_CONSOLE_SINK_RPC_REPORTS
     if ((guest_console_sink_rpc_stats.batch_calls % GUEST_CONSOLE_SINK_RPC_REPORT_INTERVAL) == 0) {
         guest_console_sink_report_rpc_stats(batch);
     }
+#endif
     guest_console_sink_reset(batch);
 }
 
@@ -182,5 +200,14 @@ void guest_putchar_putchar(int c)
     if (stream_id < 0 || stream_id > 0xff) {
         return;
     }
+#ifdef GUEST_CONSOLE_SINK_DEBUGPUTCHAR_REPORTS
+    if (!guest_console_sink_debug_marked) {
+        const char *marker = "\n[gcs first-call]\n";
+        guest_console_sink_debug_marked = 1;
+        while (*marker != '\0') {
+            seL4_DebugPutChar(*marker++);
+        }
+    }
+#endif
     guest_console_sink_emit_frame_byte((uint8_t)stream_id, (uint8_t)c);
 }
