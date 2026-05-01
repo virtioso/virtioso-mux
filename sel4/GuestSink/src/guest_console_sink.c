@@ -13,11 +13,7 @@
 #include <sel4/sel4.h>
 #include <platsupport/arch/tsc.h>
 
-#define CONSOLE_FRAME_MAGIC_0 'C'
-#define CONSOLE_FRAME_MAGIC_1 'F'
-#define CONSOLE_FRAME_VERSION 1
-#define CONSOLE_FRAME_DIRECTION_RX 1
-#define CONSOLE_FRAME_FLAGS 0
+#define TCU_MUX_ESCAPE 0xfeU
 #define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
 #ifndef GUEST_CONSOLE_SINK_RPC_REPORTS
 #define GUEST_CONSOLE_SINK_RPC_REPORTS 0
@@ -89,34 +85,59 @@ static int guest_console_sink_append_byte(guest_console_sink_batch_buffer_t *bat
 
 static void guest_console_sink_flush(guest_console_sink_batch_buffer_t *batch);
 
-static void guest_console_sink_append_frame(
+static int guest_console_sink_append_or_flush(guest_console_sink_batch_buffer_t *batch, uint8_t byte)
+{
+    if (guest_console_sink_append_byte(batch, byte) == 0) {
+        return 0;
+    }
+
+    guest_console_sink_flush(batch);
+    return guest_console_sink_append_byte(batch, byte);
+}
+
+static int guest_console_sink_begin_stream(
     guest_console_sink_batch_buffer_t *batch,
-    uint8_t framed_stream_id,
+    uint8_t stream_id
+)
+{
+    if (batch->head != batch->tail) {
+        return 0;
+    }
+
+    if (guest_console_sink_append_or_flush(batch, TCU_MUX_ESCAPE) != 0) {
+        return -1;
+    }
+    return guest_console_sink_append_or_flush(batch, stream_id);
+}
+
+static void guest_console_sink_append_mux_byte(
+    guest_console_sink_batch_buffer_t *batch,
+    uint8_t stream_id,
     uint8_t byte
 )
 {
-    uint8_t frame[] = {
-        CONSOLE_FRAME_MAGIC_0,
-        CONSOLE_FRAME_MAGIC_1,
-        CONSOLE_FRAME_VERSION,
-        framed_stream_id,
-        CONSOLE_FRAME_DIRECTION_RX,
-        CONSOLE_FRAME_FLAGS,
-        0,
-        0,
-        0,
-        1,
-        byte,
-    };
+    if ((batch->tail + 4) >= sizeof(batch->buf)) {
+        guest_console_sink_flush(batch);
+    }
 
-    for (size_t i = 0; i < sizeof(frame); i++) {
-        if (guest_console_sink_append_byte(batch, frame[i]) != 0) {
-            guest_console_sink_flush(batch);
-            if (guest_console_sink_append_byte(batch, frame[i]) != 0) {
-                return;
-            }
+    if (guest_console_sink_begin_stream(batch, stream_id) != 0) {
+        return;
+    }
+
+    if (byte == TCU_MUX_ESCAPE) {
+        if (guest_console_sink_append_or_flush(batch, TCU_MUX_ESCAPE) != 0) {
+            return;
         }
     }
+    (void)guest_console_sink_append_or_flush(batch, byte);
+}
+
+static int guest_console_sink_valid_stream_id(int stream_id)
+{
+    if (stream_id < 0 || stream_id > 0xff) {
+        return 0;
+    }
+    return stream_id != TCU_MUX_ESCAPE;
 }
 
 static void guest_console_sink_emit_report_line(guest_console_sink_batch_buffer_t *batch, const char *line)
@@ -129,11 +150,11 @@ static void guest_console_sink_emit_report_line(guest_console_sink_batch_buffer_
 #else
     int local_stream_id = guest_console_sink_stream_id();
 
-    if (local_stream_id < 0 || local_stream_id > 0xff) {
+    if (!guest_console_sink_valid_stream_id(local_stream_id)) {
         return;
     }
     while (*line != '\0') {
-        guest_console_sink_append_frame(batch, (uint8_t)local_stream_id, (uint8_t)*line++);
+        guest_console_sink_append_mux_byte(batch, (uint8_t)local_stream_id, (uint8_t)*line++);
     }
     guest_console_sink_flush(batch);
 #endif
@@ -189,7 +210,7 @@ static void guest_console_sink_flush(guest_console_sink_batch_buffer_t *batch)
     guest_console_sink_reset(batch);
 }
 
-static void guest_console_sink_emit_frame_byte(uint8_t framed_stream_id, uint8_t byte)
+static void guest_console_sink_emit_mux_byte(uint8_t stream_id, uint8_t byte)
 {
     guest_console_sink_batch_buffer_t *batch = guest_console_sink_buffer();
 
@@ -201,7 +222,7 @@ static void guest_console_sink_emit_frame_byte(uint8_t framed_stream_id, uint8_t
         guest_console_sink_reset(batch);
     }
 
-    guest_console_sink_append_frame(batch, framed_stream_id, byte);
+    guest_console_sink_append_mux_byte(batch, stream_id, byte);
 
     if (byte == '\n' || byte == '\r' ||
         (byte == ':' && guest_console_sink_is_interactive_prompt_stream()) ||
@@ -214,7 +235,7 @@ void guest_putchar_putchar(int c)
 {
     int local_stream_id = guest_console_sink_stream_id();
 
-    if (local_stream_id < 0 || local_stream_id > 0xff) {
+    if (!guest_console_sink_valid_stream_id(local_stream_id)) {
         return;
     }
 #ifdef GUEST_CONSOLE_SINK_DEBUGPUTCHAR_REPORTS
@@ -226,5 +247,5 @@ void guest_putchar_putchar(int c)
         }
     }
 #endif
-    guest_console_sink_emit_frame_byte((uint8_t)local_stream_id, (uint8_t)c);
+    guest_console_sink_emit_mux_byte((uint8_t)local_stream_id, (uint8_t)c);
 }

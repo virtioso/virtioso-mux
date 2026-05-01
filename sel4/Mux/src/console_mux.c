@@ -10,11 +10,7 @@
 #include <camkes.h>
 #include <platsupport/arch/tsc.h>
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
-#define CONSOLE_FRAME_MAGIC_0 'C'
-#define CONSOLE_FRAME_MAGIC_1 'F'
-#define CONSOLE_FRAME_VERSION 1
-#define CONSOLE_FRAME_DIRECTION_RX 1
-#define CONSOLE_FRAME_FLAGS 0
+#define TCU_MUX_ESCAPE 0xfeU
 
 typedef struct console_mux_batch_buffer {
     uint32_t head;
@@ -71,26 +67,22 @@ static void console_mux_uplink_bytes(const char *bytes, uint32_t bytes_len)
 
 static void console_mux_emit_report_line(const char *line)
 {
-    char framed[11 * 256];
+    char framed[2 + (2 * 256)];
     int local_stream_id = console_mux_stream_id();
     uint32_t out = 0;
 
-    if (local_stream_id < 0 || local_stream_id > 0xff) {
+    if (local_stream_id < 0 || local_stream_id > 0xff || local_stream_id == TCU_MUX_ESCAPE) {
         return;
     }
 
-    while (*line != '\0' && (out + 11) <= sizeof(framed)) {
-        framed[out++] = CONSOLE_FRAME_MAGIC_0;
-        framed[out++] = CONSOLE_FRAME_MAGIC_1;
-        framed[out++] = CONSOLE_FRAME_VERSION;
-        framed[out++] = (uint8_t)local_stream_id;
-        framed[out++] = CONSOLE_FRAME_DIRECTION_RX;
-        framed[out++] = CONSOLE_FRAME_FLAGS;
-        framed[out++] = 0;
-        framed[out++] = 0;
-        framed[out++] = 0;
-        framed[out++] = 1;
-        framed[out++] = *line++;
+    framed[out++] = TCU_MUX_ESCAPE;
+    framed[out++] = (uint8_t)local_stream_id;
+    while (*line != '\0' && (out + 2) <= sizeof(framed)) {
+        uint8_t byte = (uint8_t)*line++;
+        if (byte == TCU_MUX_ESCAPE) {
+            framed[out++] = TCU_MUX_ESCAPE;
+        }
+        framed[out++] = (char)byte;
     }
 
     if (out != 0) {

@@ -87,9 +87,10 @@ Verified implementation pieces:
   and VMM/infra diagnostics. These app assignments are now migration history,
   not the target contract.
 - [`components/GuestConsoleSink/src/guest_console_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/GuestConsoleSink/src/guest_console_sink.c:68)
-  currently wraps each payload byte in `CF` binary-frame records, but now gets
-  the stream ID from generated CAmkES identity and flushes on newline, carriage
-  return, prompt colon, or threshold.
+  now prefixes non-empty batches with `0xfe <generated-stream-id>`, escapes
+  literal payload `0xfe` bytes as `0xfe 0xfe`, gets the stream ID from
+  generated CAmkES identity, and flushes on newline, carriage return, prompt
+  colon, or threshold.
 - [`components/ConsolePassthroughSink/src/console_passthrough_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsolePassthroughSink/src/console_passthrough_sink.c:111)
   is the raw batch-to-physical-serial sink.
 - [`components/ConsoleMux/src/console_mux.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsoleMux/src/console_mux.c:42)
@@ -97,8 +98,9 @@ Verified implementation pieces:
   its optional report path now uses generated CAmkES identity and suppresses
   reports when the mux itself has no valid stream.
 - [`tools/console_router.py`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/tools/console_router.py:122)
-  contains the current `CF` binary-frame decode path and the compatibility
-  `line_prefixes` classifier.
+  no longer carries the old `CF`, JSONL, binary-frame, or `line_prefixes`
+  compatibility paths. Until the real demuxer lands, the host runner uses a
+  single `process_stdio` channel.
 
 This work should not remain an x86-only branch of the architecture. The useful
 parts are the current need for distinct stream identities, CAmkES producer
@@ -108,6 +110,10 @@ transport implementations are not compatibility constraints: `CF`,
 `binary_frames`, `jsonl_frames` as a mux transport, and `line_prefixes` should
 be dropped from the mux/demux target rather than maintained as fallback
 behavior. They exist only in local post-upstream work and are safe to rewrite.
+The first removal slice is complete for active x86 host tooling and VMM console
+transport: the old frame decoder/encoder tools are gone, and
+`projects/vm/components/Init/src/console_frame_transport.*` emits raw bytes to
+the per-component sink instead of assigning VMM stream IDs itself.
 
 ### Arm / Orin AGX State
 
@@ -382,6 +388,14 @@ Migration implication:
 Profiling/debug records must stop being injected as transport frames. Route
 them to their generated component streams or leave them as build-time debug
 output.
+
+Implementation note:
+This slice has been started on x86: `GuestConsoleSink` and the optional
+`ConsoleMux` report path now use the `0xfe` escape/switch encoding, the VMM
+console transport no longer emits `CF` records or owns stream IDs, and
+`console_router.py` / `qemu_runner.py` no longer expose the old binary, JSONL,
+or line-prefix transport modes. The remaining work is the real `0xfe` demuxer
+with runtime registry/introspection and PTY creation.
 
 ### 8. Add Hardware UART Backend Interfaces
 
