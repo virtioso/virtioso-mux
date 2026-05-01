@@ -95,6 +95,7 @@ ut_static char filelock[MAX_PATH];
 static int poll_output_timeout = DEFAULT_POLL_OUTPUT_TIMEOUT;
 static char path[MAX_PATH];
 static bool enable_write_raw_pty = false;
+static bool disable_uucp_lock = false;
 static bool virtioso_mode_enabled = false;
 static int virtioso_outer_mode = VIRTIOSO_OUTER_RAW;
 static char *virtioso_registry_path = NULL;
@@ -992,7 +993,7 @@ ut_static int open_tty_device(void)
 
     // use uucp locking if lock file directory is present
     // since minicom still uses it
-    if (stat(UUCP_DIR, &sbuf) == 0 && !uucp_locked) {
+    if (!disable_uucp_lock && stat(UUCP_DIR, &sbuf) == 0 && !uucp_locked) {
         if (uucp_set_filelock_name())  {
             fprintf(stderr, "ERROR: unable to set the filelock name\n");
             goto err;
@@ -1668,6 +1669,8 @@ void print_usage(char *argv[])
             "Save the raw output with tags to log file <path>\n");
     fprintf(stderr, "\t -w       : "
             "Enable writing to RAW client\n");
+    fprintf(stderr, "\t -L       : "
+            "Disable UUCP lock file handling for router-managed PTYs\n");
     fprintf(stderr, "\t -V <path>: "
             "Enable Virtioso inner 0xfe demux using generated stream registry JSON\n");
     fprintf(stderr, "\t -A       : "
@@ -1689,7 +1692,7 @@ int main(int argc, char *argv[])
     size_t len;
     struct thread_data *pty;
 
-    while ((opt = getopt(argc, argv, ":d:r:s:l:p:V:O:C:Ahitw")) != -1) {
+    while ((opt = getopt(argc, argv, ":d:r:s:l:p:V:O:C:AhitwL")) != -1) {
         switch (opt)
         {
             case 'd':
@@ -1723,6 +1726,9 @@ int main(int argc, char *argv[])
                 break;
             case 'w':
                 enable_write_raw_pty = true;
+                break;
+            case 'L':
+                disable_uucp_lock = true;
                 break;
             case 'p':
                 poll_output_timeout = atoi(optarg);

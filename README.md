@@ -43,6 +43,9 @@ Outer modes:
 When `-O nvidia-tcu` is selected, `-C <tag>` chooses the NVIDIA client carrying
 Virtioso traffic. The default is `CCPLEX`.
 
+When the input device is a router-managed pseudoterminal rather than a real
+UART, pass `-L` to disable UUCP lock-file handling.
+
 The first implementation slice loads PTY names and numeric stream IDs from a
 JSON registry at startup. That is only a bootstrap mechanism: the target
 architecture is for the muxer to announce generated CAmkES stream IDs and
