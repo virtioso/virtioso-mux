@@ -76,6 +76,8 @@ int uucp_lock_tty_device(void);
 #define RAW_PTY "RAW"
 #define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
 #define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
+#define VIRTIOSO_OUTER_RAW 0
+#define VIRTIOSO_OUTER_NVIDIA_TCU 1
 
 ut_static bool tcu_muxer_started = true; // Needed to exit endless while loops during testing
 ut_static const char* tty_device = DEFAULT_TTY_DEVICE;
@@ -87,6 +89,11 @@ ut_static char filelock[MAX_PATH];
 static int poll_output_timeout = DEFAULT_POLL_OUTPUT_TIMEOUT;
 static char path[MAX_PATH];
 static bool enable_write_raw_pty = false;
+static bool virtioso_mode_enabled = false;
+static int virtioso_outer_mode = VIRTIOSO_OUTER_RAW;
+static char *virtioso_registry_path = NULL;
+static char *virtioso_outer_tag_name = NULL;
+static int virtioso_outer_tag_idx = -1;
 
 struct tag {
     char *name;
@@ -176,6 +183,7 @@ int patch2flush_stream(int fd, int tag, unsigned char ch, int *p_seen_n, int *p_
 void* tty_input_handler(void *arg);
 void* pty_input_handler(void* arg);
 void print_usage(char *argv[]);
+int load_virtioso_registry(const char *registry_path);
 int invalid_baudrate(int baudrate);
 speed_t get_baudrate(int baudrate);
 int create_thread_with_stack(pthread_t *thread, void *(*start_routine)(void *), void *arg);
@@ -199,6 +207,253 @@ struct thread_data *pty_data;
 #define for_each_pty(i, pty) \
     for (i = 0, pty = &pty_data[i]; i < pty_max_count; i++, pty++)
 
+
+static char *xstrndup(const char *src, size_t len)
+{
+    char *dst = malloc(len + 1);
+    if (!dst) {
+        return NULL;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static char *read_text_file(const char *path_arg, size_t *out_len)
+{
+    struct stat st;
+    char *buf;
+    FILE *f;
+    size_t len;
+
+    if (stat(path_arg, &st) != 0) {
+        fprintf(stderr, "ERROR: failed to stat %s: %s\n", path_arg, strerror(errno));
+        return NULL;
+    }
+    if (st.st_size < 0) {
+        fprintf(stderr, "ERROR: invalid file size for %s\n", path_arg);
+        return NULL;
+    }
+    len = (size_t)st.st_size;
+    buf = malloc(len + 1);
+    if (!buf) {
+        fprintf(stderr, "ERROR: failed to allocate %zu bytes for %s\n", len + 1, path_arg);
+        return NULL;
+    }
+    f = fopen(path_arg, "rb");
+    if (!f) {
+        fprintf(stderr, "ERROR: failed to open %s: %s\n", path_arg, strerror(errno));
+        free(buf);
+        return NULL;
+    }
+    if (fread(buf, 1, len, f) != len) {
+        fprintf(stderr, "ERROR: failed to read %s\n", path_arg);
+        fclose(f);
+        free(buf);
+        return NULL;
+    }
+    fclose(f);
+    buf[len] = '\0';
+    if (out_len) {
+        *out_len = len;
+    }
+    return buf;
+}
+
+static char *json_string_value_after(const char *start, const char *key)
+{
+    const char *pos = strstr(start, key);
+    const char *value_start;
+    const char *value_end;
+
+    if (!pos) {
+        return NULL;
+    }
+    pos += strlen(key);
+    while (*pos && isspace((unsigned char)*pos)) {
+        pos++;
+    }
+    if (*pos != ':') {
+        return NULL;
+    }
+    pos++;
+    while (*pos && isspace((unsigned char)*pos)) {
+        pos++;
+    }
+    if (*pos != '"') {
+        return NULL;
+    }
+    value_start = ++pos;
+    while (*pos && *pos != '"') {
+        if (*pos == '\\') {
+            return NULL;
+        }
+        pos++;
+    }
+    if (*pos != '"') {
+        return NULL;
+    }
+    value_end = pos;
+    return xstrndup(value_start, (size_t)(value_end - value_start));
+}
+
+static int json_int_value_after(const char *start, const char *key, int *out)
+{
+    const char *pos = strstr(start, key);
+    char *endptr;
+    long value;
+
+    if (!pos) {
+        return -1;
+    }
+    pos += strlen(key);
+    while (*pos && isspace((unsigned char)*pos)) {
+        pos++;
+    }
+    if (*pos != ':') {
+        return -1;
+    }
+    pos++;
+    errno = 0;
+    value = strtol(pos, &endptr, 10);
+    if (errno || endptr == pos || value < -1 || value > 0xff) {
+        return -1;
+    }
+    *out = (int)value;
+    return 0;
+}
+
+static int append_virtioso_stream(struct tag **stream_tags, int *count, int *capacity, int stream_id, char *name)
+{
+    struct tag *new_tags;
+
+    if (stream_id < 0) {
+        free(name);
+        return 0;
+    }
+    if (stream_id > 0xff || stream_id == VIRTIOSO_UART_PROTO_ESC_START) {
+        fprintf(stderr, "ERROR: invalid Virtioso stream id %d for %s\n", stream_id, name);
+        free(name);
+        return -1;
+    }
+    for (int i = 0; i < *count; i++) {
+        if ((*stream_tags)[i].value == (unsigned char)stream_id) {
+            fprintf(stderr, "ERROR: duplicate Virtioso stream id %d\n", stream_id);
+            free(name);
+            return -1;
+        }
+        if (strcmp((*stream_tags)[i].name, name) == 0) {
+            fprintf(stderr, "ERROR: duplicate Virtioso stream name %s\n", name);
+            free(name);
+            return -1;
+        }
+    }
+    if (*count == *capacity) {
+        int next_capacity = *capacity ? *capacity * 2 : 8;
+        new_tags = realloc(*stream_tags, sizeof(**stream_tags) * (size_t)next_capacity);
+        if (!new_tags) {
+            free(name);
+            return -1;
+        }
+        *stream_tags = new_tags;
+        *capacity = next_capacity;
+    }
+    (*stream_tags)[*count].name = name;
+    (*stream_tags)[*count].value = (unsigned char)stream_id;
+    (*count)++;
+    return 0;
+}
+
+int load_virtioso_registry(const char *registry_path)
+{
+    char *json;
+    const char *pos;
+    struct tag *stream_tags = NULL;
+    int stream_count = 0;
+    int stream_capacity = 0;
+
+    json = read_text_file(registry_path, NULL);
+    if (!json) {
+        return -1;
+    }
+    pos = json;
+    while ((pos = strstr(pos, "\"stream_id\"")) != NULL) {
+        const char *object_end = strchr(pos, '}');
+        const char *component_pos;
+        int stream_id;
+        char *name;
+
+        if (!object_end) {
+            fprintf(stderr, "ERROR: malformed Virtioso registry near stream_id\n");
+            goto fail;
+        }
+        if (json_int_value_after(pos, "\"stream_id\"", &stream_id) != 0) {
+            fprintf(stderr, "ERROR: malformed Virtioso stream_id\n");
+            goto fail;
+        }
+        component_pos = strstr(pos, "\"component\"");
+        if (!component_pos || component_pos > object_end) {
+            fprintf(stderr, "ERROR: malformed Virtioso component name\n");
+            goto fail;
+        }
+        name = json_string_value_after(component_pos, "\"component\"");
+        if (!name) {
+            free(name);
+            fprintf(stderr, "ERROR: malformed Virtioso component name\n");
+            goto fail;
+        }
+        if (append_virtioso_stream(&stream_tags, &stream_count, &stream_capacity, stream_id, name) != 0) {
+            goto fail;
+        }
+        pos = object_end + 1;
+    }
+    free(json);
+    if (stream_count == 0) {
+        fprintf(stderr, "ERROR: Virtioso registry has no valid streams\n");
+        goto fail_no_json;
+    }
+    tags = stream_tags;
+    num_proc = stream_count;
+    default_tag_idx = 0;
+    return 0;
+
+fail:
+    free(json);
+fail_no_json:
+    for (int i = 0; i < stream_count; i++) {
+        free(stream_tags[i].name);
+    }
+    free(stream_tags);
+    return -1;
+}
+
+static int find_chip_tag_idx_by_name(const char *name)
+{
+    int tag_idx;
+    const struct tag *tag;
+
+    for (tag_idx = 0, tag = &chip_tags[tag_idx];
+         tag_idx < (int)(sizeof(chip_tags) / sizeof(chip_tags[0]));
+         tag_idx++, tag++) {
+        if (strcmp(tag->name, name) == 0) {
+            return tag_idx;
+        }
+    }
+    return -1;
+}
+
+static int find_virtioso_pty_idx_by_stream_id(unsigned char stream_id)
+{
+    int tag_idx;
+    const struct tag *tag;
+
+    for_each_tags(tag_idx, tag) {
+        if (tag->value == stream_id) {
+            return tag_idx;
+        }
+    }
+    return -1;
+}
 
 bool should_retry_io(ssize_t ret)
 {
@@ -371,6 +626,114 @@ int patch2flush_stream(int fd, int pty_idx, unsigned char ch, int *p_seen_n, int
         *p_seen_n = 0;
     }
 
+    return 0;
+}
+
+static int feed_virtioso_byte(
+    unsigned char ch,
+    bool *in_escape,
+    int *cur_rx_stream,
+    int *seen_n,
+    int *seen_r
+)
+{
+    int stream_idx;
+
+    if (*in_escape) {
+        *in_escape = false;
+        if (ch == VIRTIOSO_UART_PROTO_ESC_ESC) {
+            if (*cur_rx_stream >= 0) {
+                return patch2flush_stream(
+                    pty_data[*cur_rx_stream].fd,
+                    *cur_rx_stream,
+                    ch,
+                    &seen_n[*cur_rx_stream],
+                    &seen_r[*cur_rx_stream]
+                );
+            }
+            return 0;
+        }
+        stream_idx = find_virtioso_pty_idx_by_stream_id(ch);
+        if (stream_idx >= 0) {
+            *cur_rx_stream = stream_idx;
+        } else {
+            *cur_rx_stream = -1;
+        }
+        return 0;
+    }
+
+    if (ch == VIRTIOSO_UART_PROTO_ESC_START) {
+        *in_escape = true;
+        return 0;
+    }
+
+    if (*cur_rx_stream < 0) {
+        return 0;
+    }
+    return patch2flush_stream(
+        pty_data[*cur_rx_stream].fd,
+        *cur_rx_stream,
+        ch,
+        &seen_n[*cur_rx_stream],
+        &seen_r[*cur_rx_stream]
+    );
+}
+
+static int feed_nvidia_outer_or_virtioso_raw(
+    unsigned char ch,
+    bool *outer_in_escape,
+    int *cur_outer_tag,
+    bool *virtioso_in_escape,
+    int *cur_rx_stream,
+    int *seen_n,
+    int *seen_r
+)
+{
+    int tag_idx;
+    const struct tag *tag;
+
+    if (virtioso_outer_mode == VIRTIOSO_OUTER_RAW) {
+        return feed_virtioso_byte(ch, virtioso_in_escape, cur_rx_stream, seen_n, seen_r);
+    }
+
+    if (*outer_in_escape) {
+        *outer_in_escape = false;
+        if (ch == UART_PROTO_ESC_ESC) {
+            if (*cur_outer_tag == virtioso_outer_tag_idx) {
+                return feed_virtioso_byte(
+                    UART_PROTO_ESC_START,
+                    virtioso_in_escape,
+                    cur_rx_stream,
+                    seen_n,
+                    seen_r
+                );
+            }
+            return 0;
+        }
+        if (ch == UART_PROTO_ESC_RESET) {
+            *cur_outer_tag = -1;
+            *cur_rx_stream = -1;
+            *virtioso_in_escape = false;
+            return 0;
+        }
+        for (tag_idx = 0, tag = &chip_tags[tag_idx];
+             tag_idx < (int)(sizeof(chip_tags) / sizeof(chip_tags[0]));
+             tag_idx++, tag++) {
+            if (ch == tag->value) {
+                *cur_outer_tag = tag_idx;
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+    if (ch == UART_PROTO_ESC_START) {
+        *outer_in_escape = true;
+        return 0;
+    }
+    if (*cur_outer_tag == virtioso_outer_tag_idx) {
+        return feed_virtioso_byte(ch, virtioso_in_escape, cur_rx_stream, seen_n, seen_r);
+    }
     return 0;
 }
 
@@ -578,7 +941,11 @@ void* tty_input_handler(void *arg)
     unsigned char ch;
     bool tag_match = false;
     bool in_escape = false;
+    bool virtioso_in_escape = false;
+    bool virtioso_outer_in_escape = false;
     int cur_rx_guest = 0;
+    int cur_rx_stream = -1;
+    int cur_outer_tag = -1;
     int tag_idx;
     const struct tag *tag;
 
@@ -646,6 +1013,22 @@ void* tty_input_handler(void *arg)
             patch2flush_stream(pty_data[raw_pty_idx].fd, raw_pty_idx,
                 ch, &seen_n[raw_pty_idx], &seen_r[raw_pty_idx]);
 
+            if (virtioso_mode_enabled) {
+                ret_val = feed_nvidia_outer_or_virtioso_raw(
+                    ch,
+                    &virtioso_outer_in_escape,
+                    &cur_outer_tag,
+                    &virtioso_in_escape,
+                    &cur_rx_stream,
+                    seen_n,
+                    seen_r
+                );
+                if (ret_val < 0) {
+                    goto out;
+                }
+                continue;
+            }
+
             if (in_escape) {
                 in_escape = false;
                 // Handle UTC control characters
@@ -693,6 +1076,86 @@ out:
     pthread_exit(NULL);
 }
 
+static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned char *data, size_t len)
+{
+    size_t processed = 0;
+    static bool write_raw_pty_warning_shown = false;
+    ssize_t r = 0;
+
+    if (pty_idx >= pty_max_count) {
+        fprintf(stderr, "ERROR: Invalid pty\n");
+        return -EINVAL;
+    }
+
+    if (pty_idx == raw_pty_idx) {
+        if (!enable_write_raw_pty) {
+            if (!write_raw_pty_warning_shown) {
+                fprintf(stderr, "WARNING: Writing to RAW client is disabled. Use -w to enable.\n");
+                write_raw_pty_warning_shown = true;
+            }
+            return 0;
+        }
+        pthread_mutex_lock(&tty_data.write_lock);
+        r = putbuf_or_exit(tty_data.fd, data, len);
+        pthread_mutex_unlock(&tty_data.write_lock);
+        return (int)r;
+    }
+
+    pthread_mutex_lock(&tty_data.write_lock);
+    while (processed < len) {
+        size_t chunk_size = (len - processed > MAX_WRITE_CHUNK_SIZE) ?
+                            MAX_WRITE_CHUNK_SIZE : (len - processed);
+        size_t inner_max = (chunk_size * 2) + 2;
+        size_t outer_max = (inner_max * 2) + 2;
+        unsigned char *inner_buf = malloc(inner_max);
+        unsigned char *outer_buf = malloc(outer_max);
+        size_t inner_idx = 0;
+        size_t outer_idx = 0;
+
+        if (!inner_buf || !outer_buf) {
+            free(inner_buf);
+            free(outer_buf);
+            pthread_mutex_unlock(&tty_data.write_lock);
+            return -ENOMEM;
+        }
+
+        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_START;
+        inner_buf[inner_idx++] = tags[pty_idx].value;
+        for (size_t data_index = 0; data_index < chunk_size; data_index++) {
+            unsigned char byte = data[processed + data_index];
+            if (byte == VIRTIOSO_UART_PROTO_ESC_START) {
+                inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_ESC;
+            }
+            inner_buf[inner_idx++] = byte;
+        }
+
+        if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
+            outer_buf[outer_idx++] = UART_PROTO_ESC_START;
+            outer_buf[outer_idx++] = chip_tags[virtioso_outer_tag_idx].value;
+            for (size_t inner_pos = 0; inner_pos < inner_idx; inner_pos++) {
+                unsigned char byte = inner_buf[inner_pos];
+                outer_buf[outer_idx++] = byte;
+                if (byte == UART_PROTO_ESC_START) {
+                    outer_buf[outer_idx++] = UART_PROTO_ESC_ESC;
+                }
+            }
+            r = putbuf_or_exit(tty_data.fd, outer_buf, outer_idx);
+        } else {
+            r = putbuf_or_exit(tty_data.fd, inner_buf, inner_idx);
+        }
+
+        free(inner_buf);
+        free(outer_buf);
+        if (r < 0) {
+            pthread_mutex_unlock(&tty_data.write_lock);
+            return (int)r;
+        }
+        processed += chunk_size;
+    }
+    pthread_mutex_unlock(&tty_data.write_lock);
+    return 0;
+}
+
 ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *data, size_t len)
 {
     const unsigned char esc = UART_PROTO_ESC_START;
@@ -703,6 +1166,10 @@ ut_static int write_data_to_uart(unsigned char pty_idx, const unsigned char *dat
     size_t processed = 0;
     size_t chunk_size;
     static bool write_raw_pty_warning_shown = false;
+
+    if (virtioso_mode_enabled) {
+        return write_virtioso_data_to_uart(pty_idx, data, len);
+    }
 
     if (pty_idx >= pty_max_count) {
         fprintf(stderr, "ERROR: Invalid pty\n");
@@ -968,6 +1435,12 @@ void print_usage(char *argv[])
             "Save the raw output with tags to log file <path>\n");
     fprintf(stderr, "\t -w       : "
             "Enable writing to RAW client\n");
+    fprintf(stderr, "\t -V <path>: "
+            "Enable Virtioso inner 0xfe demux using generated stream registry JSON\n");
+    fprintf(stderr, "\t -O <mode>: "
+            "Virtioso outer input mode: raw or nvidia-tcu. Default: raw\n");
+    fprintf(stderr, "\t -C <tag> : "
+            "NVIDIA TCU client tag carrying Virtioso 0xfe traffic when -O nvidia-tcu is used. Default: CCPLEX\n");
 }
 
 int main(int argc, char *argv[])
@@ -983,7 +1456,7 @@ int main(int argc, char *argv[])
     size_t len;
     struct thread_data *pty;
 
-    while ((opt = getopt(argc, argv, ":d:r:s:l:p:hitw")) != -1) {
+    while ((opt = getopt(argc, argv, ":d:r:s:l:p:V:O:C:hitw")) != -1) {
         switch (opt)
         {
             case 'd':
@@ -1021,6 +1494,23 @@ int main(int argc, char *argv[])
             case 'p':
                 poll_output_timeout = atoi(optarg);
                 break;
+            case 'V':
+                virtioso_registry_path = optarg;
+                virtioso_mode_enabled = true;
+                break;
+            case 'O':
+                if (strcmp(optarg, "raw") == 0) {
+                    virtioso_outer_mode = VIRTIOSO_OUTER_RAW;
+                } else if (strcmp(optarg, "nvidia-tcu") == 0) {
+                    virtioso_outer_mode = VIRTIOSO_OUTER_NVIDIA_TCU;
+                } else {
+                    fprintf(stderr, "ERROR: invalid -O mode %s\n", optarg);
+                    return -1;
+                }
+                break;
+            case 'C':
+                virtioso_outer_tag_name = optarg;
+                break;
             case ':':
                 fprintf(stderr, "Option `-%c` requires an argument.\n", optopt);
                 return -1;
@@ -1035,9 +1525,25 @@ int main(int argc, char *argv[])
         }
     }
 
-    tags = chip_tags;
-    num_proc = sizeof(chip_tags) / sizeof(chip_tags[0]);
-    default_tag_idx = num_proc - 1; // last tag is the default tag
+    if (virtioso_mode_enabled) {
+        if (load_virtioso_registry(virtioso_registry_path) != 0) {
+            goto err;
+        }
+        if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
+            if (!virtioso_outer_tag_name) {
+                virtioso_outer_tag_name = "CCPLEX";
+            }
+            virtioso_outer_tag_idx = find_chip_tag_idx_by_name(virtioso_outer_tag_name);
+            if (virtioso_outer_tag_idx < 0) {
+                fprintf(stderr, "ERROR: unknown NVIDIA TCU client tag %s\n", virtioso_outer_tag_name);
+                goto err;
+            }
+        }
+    } else {
+        tags = chip_tags;
+        num_proc = sizeof(chip_tags) / sizeof(chip_tags[0]);
+        default_tag_idx = num_proc - 1; // last tag is the default tag
+    }
 
     pty_max_count = num_proc + 1;
     raw_pty_idx = pty_max_count - 1; // last pty is the raw pty

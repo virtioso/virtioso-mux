@@ -49,4 +49,18 @@
 
 /** @} */
 
+/**
+ * @defgroup virtioso_uart_protocol_codes Virtioso inner UART mux protocol codes
+ * @{
+ */
+/// Specifies the character to use as the beginning of a Virtioso inner mux
+/// escape sequence. This intentionally differs from NVIDIA's 0xff escape so
+/// Virtioso streams can be carried inside a real NVIDIA TCU stream.
+#define VIRTIOSO_UART_PROTO_ESC_START 0xfeU
+
+/// Command sends the actual character that is being used for Virtioso ESC start.
+#define VIRTIOSO_UART_PROTO_ESC_ESC   0xfeU
+
+/** @} */
+
 #endif
