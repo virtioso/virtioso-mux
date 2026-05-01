@@ -641,6 +641,14 @@ introspection exists.
 
 ### Phase 4: x86 Proof
 
+Initial implementation:
+`tools/console_router.py` now supports `transport.type = "virtioso_tcu_mux"`.
+For `vm_qemu_virtio` profiles, `tools/qemu_runner.py` writes a local runner
+manifest that starts `sources/tcu_muxer/tcu_muxer -A` and records dynamic
+PTY/log sessions from stream announcements. Remote bundles deliberately keep
+their inner manifest as `process_stdio`; the local runner-side router demuxes
+the SSH stream so we do not run two demuxers in series.
+
 1. Clean build from workspace root:
    `make mrproper`, `make qemu_x86_64_defconfig`, `make vm_qemu_virtio`.
 2. Submit through Autopilot using the canonical

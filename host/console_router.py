@@ -169,6 +169,13 @@ def _channel_runtime_map(runtimes: list[ChannelRuntime]) -> dict[str, ChannelRun
 def _write_proc_input(stdin_fd: int | None, data: bytes) -> None:
     if stdin_fd is None or not data:
         return
+
+
+def _transport_str(transport: dict[str, Any], key: str) -> str:
+    value = transport.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConsoleRouterError(f"transport field {key!r} must be a non-empty string")
+    return value
     try:
         os.write(stdin_fd, data)
     except OSError:
@@ -340,12 +347,221 @@ def _set_nonblocking(fd: int) -> None:
     os.set_blocking(fd, False)
 
 
+def _write_dynamic_sessions_manifest(runtime_dir: Path, sessions: dict[str, dict[str, Any]]) -> None:
+    payload = {
+        "version": 1,
+        "sessions": [sessions[name] for name in sorted(sessions)],
+    }
+    (runtime_dir / "sessions.json").write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _record_dynamic_mux_session(
+    runtime_dir: Path,
+    sessions: dict[str, dict[str, Any]],
+    *,
+    name: str,
+    pty_path: str,
+    log_path: Path,
+) -> None:
+    channels_dir = runtime_dir / "channels"
+    channel_dir = channels_dir / name
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    pty_link = channel_dir / "pty"
+    if pty_link.exists() or pty_link.is_symlink():
+        pty_link.unlink()
+    pty_link.symlink_to(pty_path)
+    channel_payload = {
+        "id": None,
+        "name": name,
+        "kind": "virtioso_mux_stream",
+        "interactive": name != "RAW",
+        "pty": True,
+        "raw_log": str(log_path),
+        "events_log": None,
+        "source": "tcu_muxer_announcement",
+    }
+    (channel_dir / "channel.json").write_text(json.dumps(channel_payload, indent=2) + "\n")
+    sessions[name] = {
+        "session_id": name,
+        "name": name,
+        "kind": "virtioso_mux_stream",
+        "interactive": name != "RAW",
+        "log_path": str(log_path),
+        "events_path": None,
+        "pty_path": pty_path,
+    }
+    _write_dynamic_sessions_manifest(runtime_dir, sessions)
+
+
+def _drain_tcu_muxer_mappings(
+    runtime_dir: Path,
+    sessions: dict[str, dict[str, Any]],
+    logs_dir: Path,
+    buffer: bytearray,
+    data: bytes,
+) -> None:
+    buffer.extend(data)
+    while True:
+        newline_idx = buffer.find(b"\n")
+        if newline_idx < 0:
+            break
+        line = bytes(buffer[:newline_idx + 1])
+        del buffer[:newline_idx + 1]
+        os.write(sys.stdout.fileno(), line)
+        text = line.decode("utf-8", errors="replace").strip()
+        if "\t" not in text:
+            continue
+        pty_path, name = text.split("\t", 1)
+        if not pty_path or not name:
+            continue
+        _record_dynamic_mux_session(
+            runtime_dir,
+            sessions,
+            name=name,
+            pty_path=pty_path,
+            log_path=logs_dir / f"{name}.txt",
+        )
+
+
+def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[str]) -> int:
+    transport = manifest.transport
+    tcu_muxer_path = Path(_transport_str(transport, "tcu_muxer_path")).expanduser().resolve()
+    if not tcu_muxer_path.exists():
+        raise ConsoleRouterError(f"tcu_muxer binary not found: {tcu_muxer_path}")
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "runtime-manifest.json").write_text(json.dumps(_runtime_manifest_payload(manifest), indent=2) + "\n")
+    logs_dir = runtime_dir / "tcu_muxer_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    sessions: dict[str, dict[str, Any]] = {}
+    _write_dynamic_sessions_manifest(runtime_dir, sessions)
+
+    uart_master_fd, uart_slave_fd = pty.openpty()
+    tty.setraw(uart_slave_fd)
+    uart_slave_path = os.ttyname(uart_slave_fd)
+    os.close(uart_slave_fd)
+    uart_slave_fd = -1
+    tcu_stderr_path = runtime_dir / "tcu_muxer.stderr.log"
+
+    tcu_cmd = [
+        str(tcu_muxer_path),
+        "-A",
+        "-O",
+        str(transport.get("outer", "raw")),
+        "-d",
+        uart_slave_path,
+        "-s",
+        str(logs_dir),
+        "-l",
+        str(runtime_dir / "tcu_muxer.raw.log"),
+        "-L",
+    ]
+    outer_client = transport.get("outer_client")
+    if isinstance(outer_client, str) and outer_client:
+        tcu_cmd.extend(["-C", outer_client])
+
+    tcu_proc = subprocess.Popen(
+        tcu_cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        start_new_session=True,
+    )
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=uart_master_fd,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        start_new_session=True,
+    )
+
+    if proc.stdin is None or tcu_proc.stdout is None or tcu_proc.stderr is None:
+        raise ConsoleRouterError("failed to create virtioso_tcu_mux subprocess pipes")
+
+    _set_nonblocking(uart_master_fd)
+    _set_nonblocking(proc.stdin.fileno())
+    _set_nonblocking(tcu_proc.stdout.fileno())
+    _set_nonblocking(tcu_proc.stderr.fileno())
+    try:
+        _set_nonblocking(sys.stdin.fileno())
+    except OSError:
+        pass
+
+    selector = selectors.DefaultSelector()
+    selector.register(uart_master_fd, selectors.EVENT_READ, ("mux_to_proc", None))
+    selector.register(tcu_proc.stdout.fileno(), selectors.EVENT_READ, ("tcu_stdout", None))
+    selector.register(tcu_proc.stderr.fileno(), selectors.EVENT_READ, ("tcu_stderr", None))
+    try:
+        selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
+    except Exception:
+        pass
+
+    mapping_buffer = bytearray()
+    return_code = 0
+    producer_done_at: float | None = None
+    try:
+        while True:
+            for key, _mask in selector.select(timeout=0.1):
+                kind, _payload = key.data
+                try:
+                    data = os.read(key.fd, 4096)
+                except OSError as exc:
+                    if exc.errno in {errno.EIO, errno.EBADF}:
+                        data = b""
+                    else:
+                        raise
+                if not data:
+                    try:
+                        selector.unregister(key.fd)
+                    except Exception:
+                        pass
+                    continue
+                if kind == "mux_to_proc":
+                    _write_proc_input(proc.stdin.fileno(), data)
+                elif kind == "tcu_stdout":
+                    _drain_tcu_muxer_mappings(runtime_dir, sessions, logs_dir, mapping_buffer, data)
+                elif kind == "tcu_stderr":
+                    os.write(sys.stderr.fileno(), data)
+                    with open(tcu_stderr_path, "ab", buffering=0) as f:
+                        f.write(data)
+                elif kind == "stdin_in":
+                    _write_proc_input(proc.stdin.fileno(), data)
+
+            polled = proc.poll()
+            if polled is not None and producer_done_at is None:
+                return_code = polled
+                producer_done_at = time.monotonic()
+            if producer_done_at is not None and (time.monotonic() - producer_done_at) >= 0.5:
+                break
+    finally:
+        selector.close()
+        os.close(uart_master_fd)
+        if uart_slave_fd >= 0:
+            os.close(uart_slave_fd)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+        if tcu_proc.poll() is None:
+            tcu_proc.terminate()
+            tcu_proc.wait(timeout=5)
+
+    if mapping_buffer:
+        os.write(sys.stdout.fileno(), bytes(mapping_buffer))
+    if return_code == 0 and tcu_proc.returncode not in {0, None, -15}:
+        return_code = tcu_proc.returncode
+    return return_code
+
+
 def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
     manifest = load_manifest(manifest_path)
     transport_type = manifest.transport.get("type")
+    if transport_type == "virtioso_tcu_mux":
+        return _run_virtioso_tcu_mux(manifest, runtime_dir, command)
     if transport_type != "process_stdio":
         raise ConsoleRouterError(
-            "run-command currently supports only transport.type=process_stdio; "
+            "run-command currently supports transport.type=process_stdio or virtioso_tcu_mux; "
             f"got {transport_type!r}"
         )
     if len(manifest.channels) != 1:
