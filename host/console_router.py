@@ -527,6 +527,8 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
                 try:
                     data = os.read(key.fd, 4096)
                 except OSError as exc:
+                    if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                        continue
                     if exc.errno in {errno.EIO, errno.EBADF}:
                         data = b""
                     else:
