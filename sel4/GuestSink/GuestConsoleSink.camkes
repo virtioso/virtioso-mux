@@ -8,8 +8,6 @@ import <PutChar.idl4>;
 import <Batch.idl4>;
 
 component GuestConsoleSink {
-    attribute int stream_id = 0;
-
     provides PutChar guest_putchar;
     uses Batch mux_batch;
 }

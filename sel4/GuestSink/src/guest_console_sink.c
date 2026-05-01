@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <camkes.h>
 #include <sel4/sel4.h>
@@ -17,7 +18,6 @@
 #define CONSOLE_FRAME_VERSION 1
 #define CONSOLE_FRAME_DIRECTION_RX 1
 #define CONSOLE_FRAME_FLAGS 0
-#define CONSOLE_FRAME_STREAM_VMM_DEBUG 7
 #define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
 #ifndef GUEST_CONSOLE_SINK_RPC_REPORTS
 #define GUEST_CONSOLE_SINK_RPC_REPORTS 0
@@ -43,6 +43,9 @@ typedef struct guest_console_sink_rpc_stats {
 static guest_console_sink_rpc_stats_t guest_console_sink_rpc_stats;
 static int guest_console_sink_debug_marked;
 
+extern const char *get_instance_name(void);
+extern int get_instance_console_stream_id(void);
+
 static inline uint64_t guest_console_sink_cycles_now(void)
 {
     return rdtsc_pure();
@@ -53,9 +56,16 @@ static guest_console_sink_batch_buffer_t *guest_console_sink_buffer(void)
     return (guest_console_sink_batch_buffer_t *)mux_batch_get_buf();
 }
 
-static int guest_console_sink_is_interactive_prompt_stream(uint8_t framed_stream_id)
+static int guest_console_sink_stream_id(void)
 {
-    return framed_stream_id == 1 || framed_stream_id == 5;
+    return get_instance_console_stream_id();
+}
+
+static int guest_console_sink_is_interactive_prompt_stream(void)
+{
+    const char *name = get_instance_name();
+
+    return name != NULL && strstr(name, "_guest_console_sink") != NULL;
 }
 
 static void guest_console_sink_reset(guest_console_sink_batch_buffer_t *batch)
@@ -117,8 +127,13 @@ static void guest_console_sink_emit_report_line(guest_console_sink_batch_buffer_
         seL4_DebugPutChar(*line++);
     }
 #else
+    int local_stream_id = guest_console_sink_stream_id();
+
+    if (local_stream_id < 0 || local_stream_id > 0xff) {
+        return;
+    }
     while (*line != '\0') {
-        guest_console_sink_append_frame(batch, CONSOLE_FRAME_STREAM_VMM_DEBUG, (uint8_t)*line++);
+        guest_console_sink_append_frame(batch, (uint8_t)local_stream_id, (uint8_t)*line++);
     }
     guest_console_sink_flush(batch);
 #endif
@@ -131,7 +146,7 @@ static void guest_console_sink_report_rpc_stats(guest_console_sink_batch_buffer_
         line,
         sizeof(line),
         "\n[rpcprof] gcs caller stream=%d calls=%llu payload=%llu cyc=%llu avg_call=%llu avg_byte=%llu\n",
-        stream_id,
+        guest_console_sink_stream_id(),
         (unsigned long long)guest_console_sink_rpc_stats.batch_calls,
         (unsigned long long)guest_console_sink_rpc_stats.batch_payload_bytes,
         (unsigned long long)guest_console_sink_rpc_stats.batch_cycles,
@@ -189,7 +204,7 @@ static void guest_console_sink_emit_frame_byte(uint8_t framed_stream_id, uint8_t
     guest_console_sink_append_frame(batch, framed_stream_id, byte);
 
     if (byte == '\n' || byte == '\r' ||
-        (byte == ':' && guest_console_sink_is_interactive_prompt_stream(framed_stream_id)) ||
+        (byte == ':' && guest_console_sink_is_interactive_prompt_stream()) ||
         batch->tail >= GUEST_CONSOLE_SINK_FLUSH_THRESHOLD) {
         guest_console_sink_flush(batch);
     }
@@ -197,7 +212,9 @@ static void guest_console_sink_emit_frame_byte(uint8_t framed_stream_id, uint8_t
 
 void guest_putchar_putchar(int c)
 {
-    if (stream_id < 0 || stream_id > 0xff) {
+    int local_stream_id = guest_console_sink_stream_id();
+
+    if (local_stream_id < 0 || local_stream_id > 0xff) {
         return;
     }
 #ifdef GUEST_CONSOLE_SINK_DEBUGPUTCHAR_REPORTS
@@ -209,5 +226,5 @@ void guest_putchar_putchar(int c)
         }
     }
 #endif
-    guest_console_sink_emit_frame_byte((uint8_t)stream_id, (uint8_t)c);
+    guest_console_sink_emit_frame_byte((uint8_t)local_stream_id, (uint8_t)c);
 }
