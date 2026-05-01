@@ -285,6 +285,16 @@ The forked demuxer must support two upstream UART shapes:
   the behavior in `sources/tcu_muxer/tcu_com.c`, while still using `0xfe` for
   our nested stream switching.
 
+Initial implementation:
+`sources/tcu_muxer` now has a Virtioso mode selected by
+`-V <console-stream-registry.json>`. In that mode, NVIDIA `0xff` TCU handling
+stays an outer protocol selected with `-O nvidia-tcu -C <tag>`, while
+`-O raw` treats input as an already-selected Virtioso byte stream. The inner
+parser uses `0xfe <stream-id>` stream switches and `0xfe 0xfe` literal escapes
+and creates PTYs from runtime-loaded stream names. The JSON loader is a
+bootstrap path only; the target remains live mux introspection from the seL4
+side.
+
 Affected areas:
 
 - `tools/console_router.py` or its replacement
