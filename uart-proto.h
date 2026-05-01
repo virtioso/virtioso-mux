@@ -61,6 +61,12 @@
 /// Command sends the actual character that is being used for Virtioso ESC start.
 #define VIRTIOSO_UART_PROTO_ESC_ESC   0xfeU
 
+/// Switches from normal stream selection to a Virtioso control record.
+#define VIRTIOSO_UART_PROTO_ESC_CONTROL 0xfdU
+
+/// Announces one generated CAmkES stream: STREAM_ANNOUNCE, id, name_len, name bytes.
+#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_ANNOUNCE 0x01U
+
 /** @} */
 
 #endif

@@ -27,8 +27,9 @@ client. It handles the tag communication protocol below:
 
 ## Virtioso inner mux mode
 
-The Virtioso fork can also demux a nested CAmkES console stream protocol. This
-mode is enabled with `-V <console-stream-registry.json>`.
+The Virtioso fork can also demux a nested CAmkES console stream protocol. The
+bootstrap/debug mode is enabled with `-V <console-stream-registry.json>`. The
+runtime-introspection mode is enabled with `-A`.
 
 The NVIDIA TCU protocol remains the outer protocol and keeps using `0xff`.
 Virtioso streams use an inner escape byte, `0xfe`, so the nested stream can be
@@ -47,3 +48,10 @@ JSON registry at startup. That is only a bootstrap mechanism: the target
 architecture is for the muxer to announce generated CAmkES stream IDs and
 component names at runtime, then for the demuxer to create PTYs from that live
 introspection data.
+
+Runtime announcements use:
+
+    0xfe 0xfd 0x01 <stream-id> <name-len> <name-bytes>
+
+Stream IDs `0`, `0xfd`, and `0xfe` are reserved. Normal payload routing still
+uses `0xfe <stream-id>`, and literal payload `0xfe` is escaped as `0xfe 0xfe`.
