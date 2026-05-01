@@ -15,7 +15,6 @@
 #define CONSOLE_FRAME_VERSION 1
 #define CONSOLE_FRAME_DIRECTION_RX 1
 #define CONSOLE_FRAME_FLAGS 0
-#define CONSOLE_FRAME_STREAM_VMM_DEBUG 7
 
 typedef struct console_mux_batch_buffer {
     uint32_t head;
@@ -34,9 +33,16 @@ typedef struct console_mux_rpc_stats {
 
 static console_mux_rpc_stats_t console_mux_rpc_stats;
 
+extern int get_instance_console_stream_id(void);
+
 static inline uint64_t console_mux_cycles_now(void)
 {
     return rdtsc_pure();
+}
+
+static int console_mux_stream_id(void)
+{
+    return get_instance_console_stream_id();
 }
 
 static void console_mux_uplink_bytes(const char *bytes, uint32_t bytes_len)
@@ -66,13 +72,18 @@ static void console_mux_uplink_bytes(const char *bytes, uint32_t bytes_len)
 static void console_mux_emit_report_line(const char *line)
 {
     char framed[11 * 256];
+    int local_stream_id = console_mux_stream_id();
     uint32_t out = 0;
+
+    if (local_stream_id < 0 || local_stream_id > 0xff) {
+        return;
+    }
 
     while (*line != '\0' && (out + 11) <= sizeof(framed)) {
         framed[out++] = CONSOLE_FRAME_MAGIC_0;
         framed[out++] = CONSOLE_FRAME_MAGIC_1;
         framed[out++] = CONSOLE_FRAME_VERSION;
-        framed[out++] = CONSOLE_FRAME_STREAM_VMM_DEBUG;
+        framed[out++] = (uint8_t)local_stream_id;
         framed[out++] = CONSOLE_FRAME_DIRECTION_RX;
         framed[out++] = CONSOLE_FRAME_FLAGS;
         framed[out++] = 0;
