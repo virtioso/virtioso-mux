@@ -292,8 +292,11 @@ stays an outer protocol selected with `-O nvidia-tcu -C <tag>`, while
 `-O raw` treats input as an already-selected Virtioso byte stream. The inner
 parser uses `0xfe <stream-id>` stream switches and `0xfe 0xfe` literal escapes
 and creates PTYs from runtime-loaded stream names. The JSON loader is a
-bootstrap path only; the target remains live mux introspection from the seL4
-side.
+bootstrap/debug path only. The live path uses `-A`, starts with only the RAW
+PTY, then creates stream PTYs dynamically from target announcements:
+`0xfe 0xfd 0x01 <stream-id> <name-len> <name-bytes>`. `GuestConsoleSink` emits
+that announcement before its first payload batch. Stream IDs `0`, `0xfd`, and
+`0xfe` are reserved and must not be assigned to CAmkES streams.
 
 Affected areas:
 

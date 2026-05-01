@@ -14,6 +14,8 @@
 #include <platsupport/arch/tsc.h>
 
 #define TCU_MUX_ESCAPE 0xfeU
+#define TCU_MUX_CONTROL 0xfdU
+#define TCU_MUX_CONTROL_STREAM_ANNOUNCE 0x01U
 #define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
 #ifndef GUEST_CONSOLE_SINK_RPC_REPORTS
 #define GUEST_CONSOLE_SINK_RPC_REPORTS 0
@@ -38,6 +40,7 @@ typedef struct guest_console_sink_rpc_stats {
 
 static guest_console_sink_rpc_stats_t guest_console_sink_rpc_stats;
 static int guest_console_sink_debug_marked;
+static int guest_console_sink_announced;
 
 extern const char *get_instance_name(void);
 extern int get_instance_console_stream_id(void);
@@ -110,6 +113,46 @@ static int guest_console_sink_begin_stream(
     return guest_console_sink_append_or_flush(batch, stream_id);
 }
 
+static void guest_console_sink_announce_stream(
+    guest_console_sink_batch_buffer_t *batch,
+    uint8_t stream_id
+)
+{
+    const char *name = get_instance_name();
+    size_t name_len;
+
+    if (guest_console_sink_announced || name == NULL) {
+        return;
+    }
+
+    name_len = strlen(name);
+    if (name_len == 0) {
+        return;
+    }
+    if (name_len > 255) {
+        name_len = 255;
+    }
+
+    if (batch->head != batch->tail) {
+        guest_console_sink_flush(batch);
+    }
+
+    if (guest_console_sink_append_or_flush(batch, TCU_MUX_ESCAPE) != 0 ||
+        guest_console_sink_append_or_flush(batch, TCU_MUX_CONTROL) != 0 ||
+        guest_console_sink_append_or_flush(batch, TCU_MUX_CONTROL_STREAM_ANNOUNCE) != 0 ||
+        guest_console_sink_append_or_flush(batch, stream_id) != 0 ||
+        guest_console_sink_append_or_flush(batch, (uint8_t)name_len) != 0) {
+        return;
+    }
+    for (size_t i = 0; i < name_len; i++) {
+        if (guest_console_sink_append_or_flush(batch, (uint8_t)name[i]) != 0) {
+            return;
+        }
+    }
+    guest_console_sink_announced = 1;
+    guest_console_sink_flush(batch);
+}
+
 static void guest_console_sink_append_mux_byte(
     guest_console_sink_batch_buffer_t *batch,
     uint8_t stream_id,
@@ -119,6 +162,8 @@ static void guest_console_sink_append_mux_byte(
     if ((batch->tail + 4) >= sizeof(batch->buf)) {
         guest_console_sink_flush(batch);
     }
+
+    guest_console_sink_announce_stream(batch, stream_id);
 
     if (guest_console_sink_begin_stream(batch, stream_id) != 0) {
         return;
@@ -134,10 +179,10 @@ static void guest_console_sink_append_mux_byte(
 
 static int guest_console_sink_valid_stream_id(int stream_id)
 {
-    if (stream_id < 0 || stream_id > 0xff) {
+    if (stream_id <= 0 || stream_id > 0xff) {
         return 0;
     }
-    return stream_id != TCU_MUX_ESCAPE;
+    return stream_id != TCU_MUX_ESCAPE && stream_id != TCU_MUX_CONTROL;
 }
 
 static void guest_console_sink_emit_report_line(guest_console_sink_batch_buffer_t *batch, const char *line)

@@ -11,6 +11,7 @@
 #include <platsupport/arch/tsc.h>
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
 #define TCU_MUX_ESCAPE 0xfeU
+#define TCU_MUX_CONTROL 0xfdU
 
 typedef struct console_mux_batch_buffer {
     uint32_t head;
@@ -71,7 +72,8 @@ static void console_mux_emit_report_line(const char *line)
     int local_stream_id = console_mux_stream_id();
     uint32_t out = 0;
 
-    if (local_stream_id < 0 || local_stream_id > 0xff || local_stream_id == TCU_MUX_ESCAPE) {
+    if (local_stream_id <= 0 || local_stream_id > 0xff ||
+        local_stream_id == TCU_MUX_ESCAPE || local_stream_id == TCU_MUX_CONTROL) {
         return;
     }
 
