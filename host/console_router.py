@@ -169,6 +169,10 @@ def _channel_runtime_map(runtimes: list[ChannelRuntime]) -> dict[str, ChannelRun
 def _write_proc_input(stdin_fd: int | None, data: bytes) -> None:
     if stdin_fd is None or not data:
         return
+    try:
+        os.write(stdin_fd, data)
+    except OSError:
+        return
 
 
 def _transport_str(transport: dict[str, Any], key: str) -> str:
@@ -176,10 +180,6 @@ def _transport_str(transport: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConsoleRouterError(f"transport field {key!r} must be a non-empty string")
     return value
-    try:
-        os.write(stdin_fd, data)
-    except OSError:
-        return
 
 
 def _register_input_sources(
@@ -393,6 +393,23 @@ def _record_dynamic_mux_session(
     _write_dynamic_sessions_manifest(runtime_dir, sessions)
 
 
+def _mirror_log_growth(path: Path, offset: int, output_fd: int) -> int:
+    try:
+        with open(path, "rb", buffering=0) as f:
+            f.seek(offset)
+            while True:
+                data = f.read(4096)
+                if not data:
+                    break
+                os.write(output_fd, data)
+                offset += len(data)
+    except FileNotFoundError:
+        return offset
+    except OSError:
+        return offset
+    return offset
+
+
 def _drain_tcu_muxer_mappings(
     runtime_dir: Path,
     sessions: dict[str, dict[str, Any]],
@@ -435,6 +452,8 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
     logs_dir.mkdir(parents=True, exist_ok=True)
     sessions: dict[str, dict[str, Any]] = {}
     _write_dynamic_sessions_manifest(runtime_dir, sessions)
+    raw_mirror_log = logs_dir / "RAW.txt"
+    raw_mirror_offset = 0
 
     uart_master_fd, uart_slave_fd = pty.openpty()
     tty.setraw(uart_slave_fd)
@@ -530,6 +549,7 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
                     _write_proc_input(proc.stdin.fileno(), data)
 
             polled = proc.poll()
+            raw_mirror_offset = _mirror_log_growth(raw_mirror_log, raw_mirror_offset, sys.stdout.fileno())
             if polled is not None and producer_done_at is None:
                 return_code = polled
                 producer_done_at = time.monotonic()
@@ -549,6 +569,7 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
 
     if mapping_buffer:
         os.write(sys.stdout.fileno(), bytes(mapping_buffer))
+    raw_mirror_offset = _mirror_log_growth(raw_mirror_log, raw_mirror_offset, sys.stdout.fileno())
     if return_code == 0 and tcu_proc.returncode not in {0, None, -15}:
         return_code = tcu_proc.returncode
     return return_code
