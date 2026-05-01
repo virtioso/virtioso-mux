@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
-"""Generate a stream registry from a preprocessed CAmkES composition."""
+"""Generate CAmkES component identity metadata for mux introspection."""
 
 import argparse
 import json
@@ -89,9 +89,10 @@ def _component_instances(preprocessed):
         seen.add(component_name)
         streams.append(
             {
-                "id": len(streams) + 1,
+                "stream_id": -1,
                 "component": component_name,
                 "type": component_type,
+                "stream_id_source": "component.common.c",
                 "direction": "unknown",
                 "aliases": [],
             }
@@ -115,20 +116,21 @@ def _write_header(path, registry):
         "#include <stddef.h>",
         "#include <stdint.h>",
         "",
-        "#define VIRTIO_CAMKES_STREAM_NONE 0u",
+        "#define VIRTIO_CAMKES_STREAM_INVALID (-1)",
     ]
     for stream in registry["streams"]:
         lines.append(
-            "#define VIRTIO_CAMKES_STREAM_%s %uu"
-            % (_sanitize_macro(stream["component"]), stream["id"])
+            "#define VIRTIO_CAMKES_STREAM_%s VIRTIO_CAMKES_STREAM_INVALID"
+            % _sanitize_macro(stream["component"])
         )
     lines.extend(
         [
             "",
             "struct virtioso_camkes_stream_descriptor {",
-            "    uint32_t id;",
+            "    int32_t stream_id;",
             "    const char *component;",
             "    const char *type;",
+            "    const char *stream_id_source;",
             "    const char *direction;",
             "};",
             "",
@@ -154,11 +156,12 @@ def _write_c(path, header_name, registry):
     ]
     for stream in registry["streams"]:
         lines.append(
-            '    {%uu, "%s", "%s", "%s"},'
+            '    {%d, "%s", "%s", "%s", "%s"},'
             % (
-                stream["id"],
+                stream["stream_id"],
                 stream["component"],
                 stream["type"],
+                stream["stream_id_source"],
                 stream["direction"],
             )
         )
@@ -192,7 +195,7 @@ def main(argv):
     preprocessed = _run_cpp(args)
     streams = _component_instances(preprocessed)
     registry = {
-        "schema": "virtioso.camkes_stream_registry.v1",
+        "schema": "virtioso.camkes_component_identity.v1",
         "name": args.name,
         "source": str(args.camkes),
         "streams": streams,
