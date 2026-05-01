@@ -139,9 +139,11 @@ a muxed fallback path.
 
 Rationale:
 The prior plans repeatedly left stream generation as a later cleanup item. That
-ordering is now wrong. The generated registry is the architectural foundation:
-it is the only allowed source of stream IDs, stream names, component names,
-directions, and host-visible metadata.
+ordering is now wrong. The generated identity registry is the architectural
+foundation: it is the only allowed source of component names, component types,
+console-stream eligibility, directions, and host-visible metadata. Numeric
+stream IDs are generated for eligible components by common CAmkES template code,
+not by hand-authored app configuration.
 
 Affected areas:
 
@@ -158,25 +160,27 @@ enumerate streams automatically before any mux byte protocol is relied on.
 
 Migration implication:
 Do not preserve the current numeric IDs even temporarily as hand-authored
-values. The initial generated registry may assign equivalent numbers for
-debugging convenience, but that assignment must come from generated artifacts
-only.
+values. All components should have generated identity metadata. Components
+without UART-like console capability should carry an invalid stream ID such as
+`-1`; only eligible console components receive valid stream IDs from a generated
+counter.
 
 Generated artifacts should include at least:
 
-- a target-side stream ID header consumed by generated stubs or mux-aware
-  components
-- a target-side stream registry table that the mux can announce at runtime
-- a host-side registry file for build/test tooling
-- enough metadata to map each stream back to its CAmkES component name and
-  direction
+- common generated component identity accessors, such as instance name,
+  component type, and console stream ID
+- a target-side identity table that the mux can announce at runtime
+- a host-side generated metadata file for inspection and build/test tooling
+- enough metadata to map each valid stream back to its CAmkES component name,
+  type, direction, and selected endpoint capability
 
 ### 2. Make Manual Stream IDs Impossible
 
 Rationale:
 The target architecture has no manually assigned stream IDs. A component,
 application, host tool, demuxer, or Autopilot chain must not carry its own
-numeric stream map.
+numeric stream map. The only valid numeric IDs are those emitted by generated
+CAmkES template code for UART-like components; other components report `-1`.
 
 Affected areas:
 
@@ -194,18 +198,22 @@ Accidental hardcoding becomes a build failure instead of a review burden.
 
 Migration implication:
 Remove or hide public APIs that let application code provide a stream ID. The
-preferred shape is that generated per-component wrappers select the stream, and
-the hand-written code only emits bytes to "my stream". If any `stream_id = ...`
-attribute remains in app CAmkES files, or if host-side code defines a numeric
-stream table, treat that as a failed migration.
+preferred shape is that common generated CAmkES component code exposes
+`get_instance_name()` plus a generated stream-ID accessor that returns `-1` for
+non-console components. Hand-written code should only emit bytes to "my
+console stream" and should not know how the numeric ID was chosen. If any
+`stream_id = ...` attribute remains in app CAmkES files, or if host-side code
+defines a numeric stream table, treat that as a failed migration.
 
-### 3. Give Every CAmkES Component Its Own Stream
+### 3. Give Every CAmkES Component Identity, Not Always A Stream
 
 Rationale:
 There is no default stream that multiple components read from or write to by
-default. A stream is owned by a CAmkES component endpoint. Shared presentation
-views can be derived later, but the wire/runtime identity remains
-component-specific.
+default. Every CAmkES component should have generated identity metadata, but
+only components with UART-like I/O capability should receive a valid stream ID.
+Non-console components should report an invalid stream ID, for example `-1`.
+Shared presentation views can be derived later, but the wire/runtime identity
+for console-bearing components remains component-specific.
 
 Affected areas:
 
@@ -214,6 +222,7 @@ Affected areas:
 - `GuestConsoleSink`, `ConsolePassthroughSink`, `ConsoleMux`, and diagnostic
   producers
 - generated CAmkES connection templates
+- common CAmkES component templates such as `component.common.c`
 - demux presentation and logging policy
 
 Short-term benefit:
@@ -227,6 +236,20 @@ model. For example, `driver_vm_console` and `user_vm_console` can remain stable
 logical labels, but each label is generated from the owning component instead
 of from a hand-written stream number.
 
+Initial stream eligibility should be conservative:
+
+- valid stream ID for components with `uses PutChar`
+- valid stream ID for components with `provides PutChar`
+- valid stream ID for components with `uses GetChar`
+- valid stream ID for components with `provides GetChar`
+- invalid stream ID for all other components by default
+
+`Batch` is intentionally not part of the first eligibility rule because it is a
+generic transport shape, not inherently a UART-like console capability. We may
+need to include `Batch` later for mux-specific batch endpoints, but that should
+be done with an explicit console-bearing annotation or connector rule rather
+than treating every `Batch` endpoint as a stream.
+
 ### 4. Add Mux/Demux Introspection
 
 Rationale:
@@ -238,6 +261,7 @@ The announcement must include at least:
 
 - stream ID
 - CAmkES component name
+- CAmkES component type
 - direction and capability metadata
 - optional stable aliases for tools that need names such as VM0 console or VM1
   console
@@ -502,13 +526,19 @@ introspection exists.
 
 ### Phase 1: Generated Registry Proof
 
-1. Build a target app and prove the generated stream registry exists before any
-   byte-encoder changes are relied on.
-2. Confirm every CAmkES component that can emit or receive console bytes has a
-   generated stream identity.
-3. Confirm no app CAmkES file manually assigns a stream ID.
-4. Confirm hand-written host tools do not define numeric stream IDs.
-5. Confirm generated host metadata contains component names, directions, and
+1. Build a target app and prove the generated component identity registry exists
+   before any byte-encoder changes are relied on.
+2. Confirm every CAmkES component has generated identity metadata.
+3. Confirm every CAmkES component without UART-like console capability reports
+   an invalid stream ID, for example `-1`.
+4. Confirm every CAmkES component with `PutChar` or `GetChar` capability gets a
+   valid generated stream ID.
+5. Confirm `Batch` endpoints are not automatically treated as console streams;
+   document any mux-specific batch endpoint that will need explicit stream
+   eligibility later.
+6. Confirm no app CAmkES file manually assigns a stream ID.
+7. Confirm hand-written host tools do not define numeric stream IDs.
+8. Confirm generated host metadata contains component names, types, directions, and
    optional stable aliases.
 
 ### Phase 2: Compile-Fail Enforcement
@@ -517,7 +547,8 @@ introspection exists.
 2. Remove public APIs that take raw stream IDs from ordinary component code.
 3. Add checks that fail the build if application CAmkES or host tooling tries
    to define manual stream IDs.
-4. Keep generated stream IDs private to generated code and registry metadata.
+4. Keep generated stream IDs private to generated code and runtime identity
+   metadata.
 
 ### Phase 3: Introspection And Demux Proof
 
