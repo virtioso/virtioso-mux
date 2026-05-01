@@ -21,6 +21,7 @@ import argparse
 import base64
 import errno
 import json
+import struct
 import os
 import pty
 import selectors
@@ -143,6 +144,12 @@ class ChannelRuntime:
 
 
 _ANSI_ESCAPE_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+_BINARY_FRAME_MAGIC = b"CF"
+_BINARY_FRAME_VERSION = 1
+_BINARY_FRAME_HEADER = struct.Struct(">2sBBBBI")
+_BINARY_FRAME_DIR_TO_CODE = {"rx": 0x01, "tx": 0x02}
+_BINARY_FRAME_CODE_TO_DIR = {value: key for key, value in _BINARY_FRAME_DIR_TO_CODE.items()}
+_BINARY_FRAME_MAX_PAYLOAD = 16 * 1024 * 1024
 
 
 def _channel_runtimes(runtime_dir: Path, manifest: Manifest) -> list[ChannelRuntime]:
@@ -209,6 +216,129 @@ def _decode_jsonl_frame(line: bytes) -> tuple[str, str, bytes]:
     return channel_name, direction, data
 
 
+def _encode_binary_frame(channel_id: int, direction: str, data: bytes) -> bytes:
+    if direction not in _BINARY_FRAME_DIR_TO_CODE:
+        raise ConsoleRouterError(f"invalid binary frame direction: {direction!r}")
+    if channel_id < 0 or channel_id > 0xFF:
+        raise ConsoleRouterError(f"invalid binary frame channel id: {channel_id}")
+    if len(data) > _BINARY_FRAME_MAX_PAYLOAD:
+        raise ConsoleRouterError(
+            f"binary frame payload too large: {len(data)} > {_BINARY_FRAME_MAX_PAYLOAD}"
+        )
+    header = _BINARY_FRAME_HEADER.pack(
+        _BINARY_FRAME_MAGIC,
+        _BINARY_FRAME_VERSION,
+        channel_id,
+        _BINARY_FRAME_DIR_TO_CODE[direction],
+        0,
+        len(data),
+    )
+    return header + data
+
+
+def _decode_binary_frame(buffer: bytearray) -> tuple[int, str, bytes] | None:
+    if len(buffer) < _BINARY_FRAME_HEADER.size:
+        return None
+    magic, version, channel_id, direction_code, _flags, payload_len = _BINARY_FRAME_HEADER.unpack(
+        bytes(buffer[:_BINARY_FRAME_HEADER.size])
+    )
+    if magic != _BINARY_FRAME_MAGIC:
+        raise ConsoleRouterError(f"invalid binary frame magic: {magic!r}")
+    if version != _BINARY_FRAME_VERSION:
+        raise ConsoleRouterError(f"unsupported binary frame version: {version}")
+    direction = _BINARY_FRAME_CODE_TO_DIR.get(direction_code)
+    if direction is None:
+        raise ConsoleRouterError(f"invalid binary frame direction code: {direction_code}")
+    if payload_len > _BINARY_FRAME_MAX_PAYLOAD:
+        raise ConsoleRouterError(
+            f"binary frame payload too large: {payload_len} > {_BINARY_FRAME_MAX_PAYLOAD}"
+        )
+    frame_len = _BINARY_FRAME_HEADER.size + payload_len
+    if len(buffer) < frame_len:
+        return None
+    payload = bytes(buffer[_BINARY_FRAME_HEADER.size:frame_len])
+    del buffer[:frame_len]
+    return channel_id, direction, payload
+
+
+def _synchronize_binary_frame_stream(buffer: bytearray) -> tuple[bool, bytes]:
+    if not buffer:
+        return False, b""
+    header_size = _BINARY_FRAME_HEADER.size
+    search_limit = max(0, len(buffer) - header_size + 1)
+    for idx in range(search_limit):
+        if buffer[idx:idx + len(_BINARY_FRAME_MAGIC)] != _BINARY_FRAME_MAGIC:
+            continue
+        _magic, version, _channel_id, direction_code, _flags, payload_len = _BINARY_FRAME_HEADER.unpack(
+            bytes(buffer[idx:idx + header_size])
+        )
+        if version != _BINARY_FRAME_VERSION:
+            continue
+        if direction_code not in _BINARY_FRAME_CODE_TO_DIR:
+            continue
+        if payload_len > _BINARY_FRAME_MAX_PAYLOAD:
+            continue
+        discarded = bytes(buffer[:idx])
+        del buffer[:idx]
+        return True, discarded
+    last_magic_idx = buffer.rfind(_BINARY_FRAME_MAGIC[:1])
+    if last_magic_idx >= 0:
+        discarded = bytes(buffer[:last_magic_idx])
+        del buffer[:last_magic_idx]
+        return False, discarded
+    else:
+        discarded = bytes(buffer)
+        buffer.clear()
+        return False, discarded
+
+
+def _emit_binary_unframed(data: bytes, runtime: ChannelRuntime | None) -> None:
+    if not data:
+        return
+    os.write(sys.stdout.fileno(), data)
+    if runtime is None:
+        return
+    runtime.append_raw(data)
+    runtime.emit_event("rx", data)
+    runtime.forward_to_pty(data)
+
+
+def _drain_binary_frame_buffer(
+    buffer: bytearray,
+    *,
+    runtime_by_id: dict[int, ChannelRuntime],
+    unframed_runtime: ChannelRuntime | None,
+    synced: bool,
+) -> bool:
+    while True:
+        if not synced:
+            synced, discarded = _synchronize_binary_frame_stream(buffer)
+            _emit_binary_unframed(discarded, unframed_runtime)
+            if not synced:
+                break
+        try:
+            decoded = _decode_binary_frame(buffer)
+        except ConsoleRouterError:
+            invalid = bytes(buffer[:1])
+            del buffer[:1]
+            _emit_binary_unframed(invalid, unframed_runtime)
+            synced = False
+            continue
+        if decoded is None:
+            break
+        channel_id, direction, frame_data = decoded
+        runtime = runtime_by_id.get(channel_id)
+        if runtime is None:
+            _emit_binary_unframed(frame_data, unframed_runtime)
+            continue
+        runtime.append_raw(frame_data)
+        runtime.emit_event(direction, frame_data)
+        if direction == "rx":
+            os.write(sys.stdout.fileno(), frame_data)
+            runtime.forward_to_pty(frame_data)
+    return synced
+
+
 def _strip_ansi_bytes(data: bytes) -> bytes:
     return _ANSI_ESCAPE_RE.sub(b"", data)
 
@@ -219,10 +349,11 @@ def _decode_prefixed_line(
     fallback_channel: str | None,
 ) -> tuple[str | None, bytes]:
     normalized = _strip_ansi_bytes(line)
+    match_candidate = normalized.lstrip(b"\r\n")
     for prefix, channel_name in prefix_map.items():
         prefix_bytes = prefix.encode("utf-8")
-        if normalized.startswith(prefix_bytes):
-            payload = normalized[len(prefix_bytes):]
+        if match_candidate.startswith(prefix_bytes):
+            payload = match_candidate[len(prefix_bytes):]
             return channel_name, payload
     return fallback_channel, normalized
 
@@ -447,9 +578,9 @@ def _set_nonblocking(fd: int) -> None:
 def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
     manifest = load_manifest(manifest_path)
     transport_type = manifest.transport.get("type")
-    if transport_type not in {"process_stdio", "jsonl_frames", "line_prefixes"}:
+    if transport_type not in {"process_stdio", "jsonl_frames", "line_prefixes", "binary_frames"}:
         raise ConsoleRouterError(
-            "run-command currently supports only transport.type=process_stdio, jsonl_frames, or line_prefixes, "
+            "run-command currently supports only transport.type=process_stdio, jsonl_frames, line_prefixes, or binary_frames, "
             f"got {transport_type!r}"
         )
     if transport_type == "process_stdio" and len(manifest.channels) != 1:
@@ -460,20 +591,26 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
     primary_runtime: ChannelRuntime | None = None
     default_input_channel: str | None = None
     framed_out_buffer = bytearray()
+    binary_out_buffer = bytearray()
     line_prefix_buffer = bytearray()
     line_prefix_map: dict[str, str] = {}
     fallback_channel: str | None = None
+    runtime_by_id: dict[int, ChannelRuntime] = {}
+    binary_unframed_runtime: ChannelRuntime | None = None
 
     runtimes = _prepare_channel_runtimes(runtime_dir, manifest)
     runtime_by_name = _channel_runtime_map(runtimes)
+    runtime_by_id = {runtime.channel.id: runtime for runtime in runtimes}
     if transport_type == "process_stdio":
         primary_runtime = runtimes[0]
-    elif transport_type == "jsonl_frames":
+    elif transport_type in {"jsonl_frames", "binary_frames"}:
         default_input_channel = _require_transport_str(manifest.transport, "default_input_channel")
         if default_input_channel not in runtime_by_name:
             raise ConsoleRouterError(
                 f"transport default_input_channel {default_input_channel!r} does not match any manifest channel"
             )
+        if transport_type == "binary_frames":
+            binary_unframed_runtime = runtime_by_name.get("vmm_debug", runtime_by_name[default_input_channel])
     else:
         default_input_channel = _require_transport_str(manifest.transport, "default_input_channel")
         if default_input_channel not in runtime_by_name:
@@ -529,6 +666,7 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
     _register_input_sources(selector, runtimes)
 
     return_code = 0
+    binary_frame_synced = transport_type != "binary_frames"
     try:
         while True:
             events = selector.select(timeout=0.1)
@@ -568,13 +706,22 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                                 runtime.append_raw(frame_data)
                                 runtime.emit_event(direction, frame_data)
                                 if direction == "rx":
+                                    os.write(sys.stdout.fileno(), frame_data)
                                     runtime.forward_to_pty(frame_data)
+                        elif transport_type == "binary_frames":
+                            binary_out_buffer.extend(data)
+                            binary_frame_synced = _drain_binary_frame_buffer(
+                                binary_out_buffer,
+                                runtime_by_id=runtime_by_id,
+                                unframed_runtime=binary_unframed_runtime,
+                                synced=binary_frame_synced,
+                            )
                         else:
                             os.write(sys.stdout.fileno(), data)
                             line_prefix_buffer.extend(data)
                             _flush_line_prefix_buffer(
                                 line_prefix_buffer,
-                                emit_partial=False,
+                                emit_partial=True,
                                 prefix_map=line_prefix_map,
                                 fallback_channel=fallback_channel,
                                 runtime_by_name=runtime_by_name,
@@ -604,6 +751,15 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                                 )
                             runtime.emit_event("tx", data)
                             _write_proc_input(stdin_fd, _encode_jsonl_frame(runtime.channel.name, "tx", data))
+                        elif transport_type == "binary_frames":
+                            input_channel = payload or default_input_channel
+                            runtime = runtime_by_name.get(str(input_channel)) if input_channel is not None else None
+                            if runtime is None:
+                                raise ConsoleRouterError(
+                                    f"input referenced unknown channel {input_channel!r}"
+                                )
+                            runtime.emit_event("tx", data)
+                            _write_proc_input(stdin_fd, _encode_binary_frame(runtime.channel.id, "tx", data))
                         else:
                             input_channel = payload or default_input_channel
                             runtime = runtime_by_name.get(str(input_channel)) if input_channel is not None else None
@@ -622,10 +778,18 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
             polled = proc.poll()
             if polled is not None:
                 return_code = polled
-                try:
-                    trailing = os.read(stdout_fd, 4096)
-                except OSError:
-                    trailing = b""
+                trailing_chunks: list[bytes] = []
+                while True:
+                    try:
+                        chunk = os.read(stdout_fd, 4096)
+                    except OSError as exc:
+                        if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                            break
+                        chunk = b""
+                    if not chunk:
+                        break
+                    trailing_chunks.append(chunk)
+                trailing = b"".join(trailing_chunks)
                 if trailing:
                     if transport_type == "process_stdio":
                         assert primary_runtime is not None
@@ -635,6 +799,8 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                         primary_runtime.forward_to_pty(trailing)
                     elif transport_type == "jsonl_frames":
                         framed_out_buffer.extend(trailing)
+                    elif transport_type == "binary_frames":
+                        binary_out_buffer.extend(trailing)
                     else:
                         os.write(sys.stdout.fileno(), trailing)
                         line_prefix_buffer.extend(trailing)
@@ -642,6 +808,16 @@ def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> i
                     raise ConsoleRouterError(
                         "jsonl_frames transport ended with an incomplete frame in the output buffer"
                     )
+                if transport_type == "binary_frames":
+                    binary_frame_synced = _drain_binary_frame_buffer(
+                        binary_out_buffer,
+                        runtime_by_id=runtime_by_id,
+                        unframed_runtime=binary_unframed_runtime,
+                        synced=binary_frame_synced,
+                    )
+                    if binary_out_buffer:
+                        _emit_binary_unframed(bytes(binary_out_buffer), binary_unframed_runtime)
+                        binary_out_buffer.clear()
                 if transport_type == "line_prefixes":
                     _flush_line_prefix_buffer(
                         line_prefix_buffer,
