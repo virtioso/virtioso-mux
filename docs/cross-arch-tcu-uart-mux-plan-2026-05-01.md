@@ -649,6 +649,20 @@ PTY/log sessions from stream announcements. Remote bundles deliberately keep
 their inner manifest as `process_stdio`; the local runner-side router demuxes
 the SSH stream so we do not run two demuxers in series.
 
+Real-run evidence from 2026-05-01:
+
+- `qemu_x86_64_defconfig` clean build completed with `make mrproper`,
+  `make qemu_x86_64_defconfig`, and `make vm_qemu_virtio`.
+- Autopilot request `20260501-175337` used `transport.type =
+  "virtioso_tcu_mux"` and created
+  `console/console-runtime/sessions.json`.
+- The router now mirrors the demuxer's `RAW` log back to stdout so the legacy
+  `tty0.raw` watcher still sees early boot text while Autopilot is being moved
+  to introspected sessions.
+- No `0xfe 0xfd` stream announcements reached the demuxer in that run. The
+  target stopped before guest console sinks could announce themselves, with
+  `X86EPTPageMap: Need a page directory first.` from `vm0:control`.
+
 1. Clean build from workspace root:
    `make mrproper`, `make qemu_x86_64_defconfig`, `make vm_qemu_virtio`.
 2. Submit through Autopilot using the canonical
