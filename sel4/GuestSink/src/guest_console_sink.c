@@ -11,7 +11,9 @@
 
 #include <camkes.h>
 #include <sel4/sel4.h>
+#if defined(__i386__) || defined(__x86_64__)
 #include <platsupport/arch/tsc.h>
+#endif
 
 #define TCU_MUX_ESCAPE 0xfeU
 #define TCU_MUX_CONTROL 0xfdU
@@ -47,7 +49,11 @@ extern int get_instance_console_stream_id(void);
 
 static inline uint64_t guest_console_sink_cycles_now(void)
 {
+#if defined(__i386__) || defined(__x86_64__)
     return rdtsc_pure();
+#else
+    return 0;
+#endif
 }
 
 static guest_console_sink_batch_buffer_t *guest_console_sink_buffer(void)
