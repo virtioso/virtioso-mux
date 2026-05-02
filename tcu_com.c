@@ -693,6 +693,7 @@ int flush_stream(int fd, int pty_idx, unsigned char ch)
 {
     char timestamp[30];
     size_t len_ts = 0;
+    ssize_t ret;
     /* 'timestamp' stores 30 chars: "[YYYY-mm-dd HH:MM:SS.ssssss] \0" */
     /* resize it accordingly when changing the timestamp format */
 
@@ -713,8 +714,12 @@ int flush_stream(int fd, int pty_idx, unsigned char ch)
         }
     }
 
-    // write to pty path
-    if (write(fd, &ch, 1) < 0)
+    // Write to pty path for interactive clients. Logs above are authoritative;
+    // an unread pty slave must not block or kill UART demuxing.
+    ret = write(fd, &ch, 1);
+    if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EIO))
+        return 0;
+    if (ret < 0)
         return -1;
 
     return 0;
