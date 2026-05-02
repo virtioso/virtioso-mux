@@ -46,11 +46,15 @@ Virtioso traffic. The default is `CCPLEX`.
 When the input device is a router-managed pseudoterminal rather than a real
 UART, pass `-L` to disable UUCP lock-file handling.
 
-The first implementation slice loads PTY names and numeric stream IDs from a
-JSON registry at startup. That is only a bootstrap mechanism: the target
-architecture is for the muxer to announce generated CAmkES stream IDs and
-component names at runtime, then for the demuxer to create PTYs from that live
-introspection data.
+In Virtioso mode, the muxer always creates one stable management channel named
+`autopilot_control` before any component stream PTYs. This is the
+Autopilot-to-muxer control/introspection channel. It is not the guest console
+and it does not mirror the raw input stream.
+
+The `-V` implementation slice loads PTY names and numeric stream IDs from a
+JSON registry at startup for bootstrap/debug use. The target runtime path is
+`-A`: the seL4 side announces generated CAmkES stream IDs and component names
+at runtime, then the muxer creates PTYs from that live introspection data.
 
 Runtime announcements use:
 
@@ -58,3 +62,9 @@ Runtime announcements use:
 
 Stream IDs `0`, `0xfd`, and `0xfe` are reserved. Normal payload routing still
 uses `0xfe <stream-id>`, and literal payload `0xfe` is escaped as `0xfe 0xfe`.
+
+For each accepted live announcement, the muxer creates the named stream PTY,
+prints the usual `<pty-path>\t<name>` mapping on stdout for session-manifest
+builders, and writes a JSON event to `autopilot_control`:
+
+    {"event":"stream_announce","stream_id":2,"name":"vm1_guest_console_sink"}

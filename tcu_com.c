@@ -74,6 +74,7 @@ int uucp_lock_tty_device(void);
 #define DEFAULT_TTY_DEVICE "/dev/ttyUSB3"
 #define UUCP_DIR "/var/lock"
 #define RAW_PTY "RAW"
+#define AUTOPILOT_CONTROL_PTY "autopilot_control"
 #define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
 #define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
 #define VIRTIOSO_OUTER_RAW 0
@@ -102,6 +103,7 @@ static char *virtioso_registry_path = NULL;
 static char *virtioso_outer_tag_name = NULL;
 static int virtioso_outer_tag_idx = -1;
 static bool virtioso_wait_for_announce = false;
+static int autopilot_control_pty_idx = -1;
 
 struct tag {
     char *name;
@@ -391,11 +393,12 @@ static int init_virtioso_tags(void)
     if (!tags) {
         return -1;
     }
-    tags[0].name = RAW_PTY;
+    tags[0].name = AUTOPILOT_CONTROL_PTY;
     tags[0].value = 0;
     num_proc = 1;
     default_tag_idx = 0;
     raw_pty_idx = 0;
+    autopilot_control_pty_idx = 0;
     return 0;
 }
 
@@ -496,6 +499,47 @@ static int find_virtioso_pty_idx_by_stream_id(unsigned char stream_id)
     return -1;
 }
 
+static void write_autopilot_control_stream_announce(unsigned char stream_id, const char *name)
+{
+    char event[(MAX_PATH * 2) + 128];
+    size_t pos = 0;
+    int prefix_len;
+
+    if (autopilot_control_pty_idx < 0 ||
+        autopilot_control_pty_idx >= pty_max_count ||
+        pty_data[autopilot_control_pty_idx].fd < 0) {
+        return;
+    }
+
+    prefix_len = snprintf(
+        event,
+        sizeof(event),
+        "{\"event\":\"stream_announce\",\"stream_id\":%u,\"name\":\"",
+        stream_id
+    );
+    if (prefix_len <= 0 || prefix_len >= (int)sizeof(event)) {
+        return;
+    }
+    pos = (size_t)prefix_len;
+    for (const char *p = name; *p != '\0' && pos + 3 < sizeof(event); p++) {
+        if (*p == '"' || *p == '\\') {
+            event[pos++] = '\\';
+        }
+        event[pos++] = *p;
+    }
+    if (pos + 3 >= sizeof(event)) {
+        return;
+    }
+    event[pos++] = '"';
+    event[pos++] = '}';
+    event[pos++] = '\n';
+
+    (void)write(pty_data[autopilot_control_pty_idx].fd, event, pos);
+    if (pty_data[autopilot_control_pty_idx].log_fd >= 0) {
+        (void)write(pty_data[autopilot_control_pty_idx].log_fd, event, pos);
+    }
+}
+
 static int append_announced_virtioso_stream(unsigned char stream_id, const char *name)
 {
     char *owned_name;
@@ -528,6 +572,7 @@ static int append_announced_virtioso_stream(unsigned char stream_id, const char 
         tags[num_proc].value = 0;
         return -1;
     }
+    write_autopilot_control_stream_announce(stream_id, name);
     num_proc++;
     pty_max_count = num_proc;
     return 0;
@@ -1174,8 +1219,10 @@ void* tty_input_handler(void *arg)
         for (index = 0; index < len; index++) {
             ch = buf[index];
 
-            patch2flush_stream(pty_data[raw_pty_idx].fd, raw_pty_idx,
-                ch, &seen_n[raw_pty_idx], &seen_r[raw_pty_idx]);
+            if (!virtioso_mode_enabled) {
+                patch2flush_stream(pty_data[raw_pty_idx].fd, raw_pty_idx,
+                    ch, &seen_n[raw_pty_idx], &seen_r[raw_pty_idx]);
+            }
 
             if (virtioso_mode_enabled) {
                 ret_val = feed_nvidia_outer_or_virtioso_raw(
@@ -1259,7 +1306,7 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
     if (pty_idx == raw_pty_idx) {
         if (!enable_write_raw_pty) {
             if (!write_raw_pty_warning_shown) {
-                fprintf(stderr, "WARNING: Writing to RAW client is disabled. Use -w to enable.\n");
+                fprintf(stderr, "WARNING: Writing to autopilot_control is disabled. Use -w to enable raw UART writes.\n");
                 write_raw_pty_warning_shown = true;
             }
             return 0;
@@ -1674,7 +1721,7 @@ void print_usage(char *argv[])
     fprintf(stderr, "\t -V <path>: "
             "Enable Virtioso inner 0xfe demux using generated stream registry JSON\n");
     fprintf(stderr, "\t -A       : "
-            "Enable Virtioso inner 0xfe demux and wait for stream announcements\n");
+            "Enable Virtioso inner 0xfe demux with autopilot_control and live stream announcements\n");
     fprintf(stderr, "\t -O <mode>: "
             "Virtioso outer input mode: raw or nvidia-tcu. Default: raw\n");
     fprintf(stderr, "\t -C <tag> : "
