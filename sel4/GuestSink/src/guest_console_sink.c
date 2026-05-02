@@ -16,6 +16,7 @@
 #endif
 
 #define TCU_MUX_ESCAPE 0xfeU
+#define TCU_MUX_DEFAULT 0x00U
 #define TCU_MUX_CONTROL 0xfdU
 #define TCU_MUX_CONTROL_STREAM_ANNOUNCE 0x01U
 #define GUEST_CONSOLE_SINK_FLUSH_THRESHOLD 1024
@@ -245,6 +246,9 @@ static void guest_console_sink_flush(guest_console_sink_batch_buffer_t *batch)
     if (batch == NULL || batch->head == batch->tail) {
         return;
     }
+
+    (void)guest_console_sink_append_byte(batch, TCU_MUX_ESCAPE);
+    (void)guest_console_sink_append_byte(batch, TCU_MUX_DEFAULT);
 
     payload_bytes = batch->tail - batch->head;
     __sync_synchronize();
