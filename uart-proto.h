@@ -61,6 +61,9 @@
 /// Command sends the actual character that is being used for Virtioso ESC start.
 #define VIRTIOSO_UART_PROTO_ESC_ESC   0xfeU
 
+/// Clears the active Virtioso component stream and returns to unframed/default output.
+#define VIRTIOSO_UART_PROTO_ESC_DEFAULT 0x00U
+
 /// Switches from normal stream selection to a Virtioso control record.
 #define VIRTIOSO_UART_PROTO_ESC_CONTROL 0xfdU
 

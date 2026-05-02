@@ -75,6 +75,7 @@ int uucp_lock_tty_device(void);
 #define UUCP_DIR "/var/lock"
 #define RAW_PTY "RAW"
 #define AUTOPILOT_CONTROL_PTY "autopilot_control"
+#define DRIVER_VM_CONSOLE_PTY "driver_vm_console"
 #define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
 #define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
 #define VIRTIOSO_OUTER_RAW 0
@@ -104,6 +105,7 @@ static char *virtioso_outer_tag_name = NULL;
 static int virtioso_outer_tag_idx = -1;
 static bool virtioso_wait_for_announce = false;
 static int autopilot_control_pty_idx = -1;
+static int virtioso_default_pty_idx = -1;
 
 struct tag {
     char *name;
@@ -395,10 +397,13 @@ static int init_virtioso_tags(void)
     }
     tags[0].name = AUTOPILOT_CONTROL_PTY;
     tags[0].value = 0;
-    num_proc = 1;
+    tags[1].name = DRIVER_VM_CONSOLE_PTY;
+    tags[1].value = 0;
+    num_proc = 2;
     default_tag_idx = 0;
     raw_pty_idx = 0;
     autopilot_control_pty_idx = 0;
+    virtioso_default_pty_idx = 1;
     return 0;
 }
 
@@ -409,12 +414,14 @@ int load_virtioso_registry(const char *registry_path)
     struct tag *stream_tags = NULL;
     int stream_count = 0;
     int stream_capacity = 0;
+    int builtin_count = 0;
 
     if (init_virtioso_tags() != 0) {
         return -1;
     }
     stream_tags = tags;
     stream_count = num_proc;
+    builtin_count = num_proc;
     stream_capacity = VIRTIOSO_MAX_PTY_COUNT;
 
     json = read_text_file(registry_path, NULL);
@@ -453,7 +460,7 @@ int load_virtioso_registry(const char *registry_path)
         pos = object_end + 1;
     }
     free(json);
-    if (stream_count == 1) {
+    if (stream_count == builtin_count) {
         fprintf(stderr, "ERROR: Virtioso registry has no valid streams\n");
         goto fail_no_json;
     }
@@ -464,7 +471,7 @@ int load_virtioso_registry(const char *registry_path)
 fail:
     free(json);
 fail_no_json:
-    for (int i = 1; i < stream_count; i++) {
+    for (int i = builtin_count; i < stream_count; i++) {
         free(stream_tags[i].name);
     }
     free(stream_tags);
@@ -809,6 +816,10 @@ static int feed_virtioso_byte(
 
     if (*in_escape) {
         *in_escape = false;
+        if (ch == VIRTIOSO_UART_PROTO_ESC_DEFAULT) {
+            *cur_rx_stream = -1;
+            return 0;
+        }
         if (ch == VIRTIOSO_UART_PROTO_ESC_ESC) {
             if (*cur_rx_stream >= 0) {
                 return patch2flush_stream(
@@ -840,6 +851,15 @@ static int feed_virtioso_byte(
     }
 
     if (*cur_rx_stream < 0) {
+        if (virtioso_default_pty_idx >= 0 && virtioso_default_pty_idx < pty_max_count) {
+            return patch2flush_stream(
+                pty_data[virtioso_default_pty_idx].fd,
+                virtioso_default_pty_idx,
+                ch,
+                &seen_n[virtioso_default_pty_idx],
+                &seen_r[virtioso_default_pty_idx]
+            );
+        }
         return 0;
     }
     return patch2flush_stream(
@@ -1161,8 +1181,8 @@ void* tty_input_handler(void *arg)
     int index;
     ssize_t len;
     int ret_val;
-    int seen_n[pty_max_count]; // flag set for seeing '\n'
-    int seen_r[pty_max_count]; // flag set for seeing '\r'
+    int seen_n[VIRTIOSO_MAX_PTY_COUNT]; // flag set for seeing '\n'
+    int seen_r[VIRTIOSO_MAX_PTY_COUNT]; // flag set for seeing '\r'
 
     memset(seen_n, 0, sizeof(seen_n));
     memset(seen_r, 0, sizeof(seen_r));
@@ -1303,10 +1323,10 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
         return -EINVAL;
     }
 
-    if (pty_idx == raw_pty_idx) {
+    if (pty_idx == raw_pty_idx || pty_idx == virtioso_default_pty_idx) {
         if (!enable_write_raw_pty) {
             if (!write_raw_pty_warning_shown) {
-                fprintf(stderr, "WARNING: Writing to autopilot_control is disabled. Use -w to enable raw UART writes.\n");
+                fprintf(stderr, "WARNING: Writing to physical UART clients is disabled. Use -w to enable raw UART writes.\n");
                 write_raw_pty_warning_shown = true;
             }
             return 0;

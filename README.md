@@ -46,10 +46,13 @@ Virtioso traffic. The default is `CCPLEX`.
 When the input device is a router-managed pseudoterminal rather than a real
 UART, pass `-L` to disable UUCP lock-file handling.
 
-In Virtioso mode, the muxer always creates one stable management channel named
-`autopilot_control` before any component stream PTYs. This is the
-Autopilot-to-muxer control/introspection channel. It is not the guest console
-and it does not mirror the raw input stream.
+In Virtioso mode, the muxer always creates two stable channels before any
+component stream PTYs:
+
+- `autopilot_control` is the Autopilot-to-muxer control/introspection channel.
+  It is not the guest console and it does not mirror the raw input stream.
+- `driver_vm_console` is the unframed physical UART default stream. It carries
+  VM0/driver-VM output when no generated component stream is selected.
 
 The `-V` implementation slice loads PTY names and numeric stream IDs from a
 JSON registry at startup for bootstrap/debug use. The target runtime path is
@@ -62,6 +65,8 @@ Runtime announcements use:
 
 Stream IDs `0`, `0xfd`, and `0xfe` are reserved. Normal payload routing still
 uses `0xfe <stream-id>`, and literal payload `0xfe` is escaped as `0xfe 0xfe`.
+`0xfe 0x00` clears the active generated component stream and returns following
+unframed bytes to `driver_vm_console`.
 
 For each accepted live announcement, the muxer creates the named stream PTY,
 prints the usual `<pty-path>\t<name>` mapping on stdout for session-manifest
