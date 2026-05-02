@@ -4,12 +4,15 @@ Date: 2026-05-01
 
 Status: active architecture plan
 
-Primary goal: make a minimal NVIDIA TCU-style UART mux available on both
-`qemu_x86_64` and Arm/Orin AGX paths, while preserving the currently useful
-console evidence from each platform.
+Primary goal: finish the CAmkES component mux/demux path on real Orin AGX
+first, while keeping the protocol and component identity model reusable across
+architectures. The `qemu_x86_64` path is now backlog/regression work, not the
+active completion target.
 
-This plan promotes the x86 console-mux work into a cross-architecture topic.
-It is the current primary note for this topic.
+This plan promotes the x86 console-mux work into a cross-architecture topic,
+but the current execution priority is Orin AGX. x86 remains useful because it
+started the stream-registry and demux work, but x86-specific completion should
+not block finishing the Orin CAmkES component mux/demux path.
 
 Related notes:
 
@@ -28,10 +31,11 @@ Reference implementation:
 ## Summary
 
 The current x86 work proves that named console streams are needed, but its
-`CF` / `binary_frames` implementation is the wrong long-term transport. The
-Arm/Orin side already has NVIDIA TCU as VM0's Linux console and UARTI
-passthrough as VM1's physical console, while the in-VMM PL011 emulator is only
-a simple output path.
+`CF` / `binary_frames` implementation is the wrong long-term transport and x86
+bring-up is not the right critical path for finishing mux/demux. The Arm/Orin
+side already has NVIDIA TCU as VM0's Linux console and UARTI passthrough as
+VM1's physical console, while the in-VMM PL011 emulator is only a simple output
+path.
 
 The recommended direction is one shared, tiny TCU-style mux protocol above the
 producer boundary, with platform-specific UART attachment below it. It is not
@@ -315,8 +319,9 @@ runtime channels.
 Migration implication:
 Use the latest seL4 community upstream commit as the compatibility boundary.
 Mux/demux work after that point is local-only and may be rewritten. The
-replacement still needs x86 `qemu_x86_64_defconfig` proof for VM0 login and
-VM1/user-VM readiness before calling the new path complete.
+replacement still needs Orin AGX proof before calling the new path complete.
+The x86 `qemu_x86_64_defconfig` proof for VM0 login and VM1/user-VM readiness
+is backlog/regression work after Orin has proven the mux/demux path.
 
 ### 5. Move Autopilot And Orin UART Selection To Introspection
 
@@ -383,7 +388,8 @@ Rationale:
 After generated stream identity exists, the target side should emit only
 registry/introspection records, stream switches, and payload bytes. Use `0xfe`
 as the escape byte, not NVIDIA's `0xff`, so this mux can run even when the
-underlying hardware path is NVIDIA TCU.
+underlying hardware path is NVIDIA TCU. Finish this path on Orin AGX first;
+the x86 proof becomes a later regression/backlog item.
 
 Affected areas:
 
@@ -394,8 +400,9 @@ Affected areas:
 - x86 and Arm CAmkES wiring selected by Kconfig
 
 Short-term benefit:
-x86 gets a real transport change only after stream ownership and host metadata
-are no longer hand-maintained.
+Orin AGX gets a real component mux/demux path only after stream ownership and
+host metadata are no longer hand-maintained. x86 can reuse the same transport
+later, but does not drive the active sequencing.
 
 Migration implication:
 Profiling/debug records must stop being injected as transport frames. Route
@@ -561,12 +568,14 @@ Affected areas:
 - Autopilot platform source discovery
 
 Short-term benefit:
-The plan can progress on x86 without destabilizing the fixed Orin UARTI path.
+The plan can progress on Orin without destabilizing the fixed UARTI proof path.
 
 Migration implication:
-The Orin target should eventually choose one of two explicit modes:
+The Orin target should choose one of two explicit modes:
 `physical-uarti-console` for direct VM1 hardware console, or
 `muxed-pl011-console` for VM1 VMM-emulated output. Do not blend them silently.
+For the current Orin-first mux work, keep UARTI as the known-good bootstrap and
+proof path while completing the muxed PL011/component-stream path alongside it.
 
 ### 12. Require Clean Repos, `before-mux` Branches, And Frequent Commits
 
@@ -639,7 +648,35 @@ introspection exists.
    when our demuxer directly handles the real TCU UART path.
 5. Confirm no active path depends on `CF`, `binary_frames`, or `line_prefixes`.
 
-### Phase 4: x86 Proof
+### Phase 4: Orin AGX Mux/Demux Proof
+
+This is now the active completion target. x86 reached enough evidence to prove
+the demux runtime can start, but x86-specific VM control faults should not hold
+the mux/demux work hostage.
+
+1. Clean build from workspace root:
+   `make mrproper`, `make orinagx_defconfig`, `make vm_qemu_virtio`.
+2. Submit through Autopilot using the canonical Orin AGX EFI chain.
+3. Preserve the known-good UARTI VM1 proof: VM1 output should still appear via
+   the platform-discovered UARTI source with `/bus@0/serial@31d0000` and INTID
+   `317`.
+4. Route at least one Orin CAmkES component stream through the generated
+   stream ID path and `0xfe` mux encoder.
+5. Confirm the demux creates named PTYs/logs from runtime announcements rather
+   than from a static Python table.
+6. Add the bidirectional guest UART proof separately: expose PL011 or the
+   selected guest UART model to Linux, route guest TX into an introspected
+   demuxed channel, inject RX from the demux/input side, and prove normal Linux
+   console interaction rather than only earlycon output.
+7. Confirm the Arm guest UART TX path uses the same producer-side buffering
+   policy: newline flush, capacity flush, and a configurable delayed flush with
+   `50 ms` as the starting default.
+8. Prove Autopilot consumes logical channel introspection rather than
+   hard-coded `tty0`/`tty1` stream assumptions.
+9. Only after that, evaluate whether UARTI remains useful as a separate
+   physical console or can be replaced by the muxed guest UART path.
+
+### Phase 5: x86 Backlog / Regression Proof
 
 Initial implementation:
 `tools/console_router.py` now supports `transport.type = "virtioso_tcu_mux"`.
@@ -663,6 +700,12 @@ Real-run evidence from 2026-05-01:
   target stopped before guest console sinks could announce themselves, with
   `X86EPTPageMap: Need a page directory first.` from `vm0:control`.
 
+Backlog rule:
+do not fix the x86 VM control EPT fault merely to complete mux/demux. Return to
+this path after the Orin AGX mux/demux path proves the generated stream
+registry, runtime announcements, demux-created channels, and Autopilot
+introspection flow.
+
 1. Clean build from workspace root:
    `make mrproper`, `make qemu_x86_64_defconfig`, `make vm_qemu_virtio`.
 2. Submit through Autopilot using the canonical
@@ -676,40 +719,27 @@ Real-run evidence from 2026-05-01:
    writes do not cause byte-at-a-time mux/uplink RPCs.
 6. Confirm no hard-coded stream IDs remain in target, demux, or Autopilot code.
 
-### Phase 5: Hardware UART Backend Proof
+### Phase 6: Hardware UART Backend Proof
 
 1. Prove the mux core builds without platform-specific UART assumptions.
-2. Prove x86 uses a QEMU serial/chardev backend selected by configuration.
-3. Prove Arm can select a UART backend from platform/app configuration.
-4. Prove Arm UART backend metadata can be supplied from device-tree or
+2. Prove Arm/Orin can select a UART backend from platform/app configuration.
+3. Prove Arm UART backend metadata can be supplied from device-tree or
    passthrough-style platform descriptions, including MMIO and IRQ ownership.
-5. Identify which UART backends are shared and which are platform-specific:
+4. Identify which UART backends are shared and which are platform-specific:
    SBSA UART, PL011, 8250-compatible UART, Tegra HSUART, NVIDIA TCU, and QEMU
    chardev are not the same thing even when they feed the same mux core.
+5. Prove x86 uses a QEMU serial/chardev backend later as backlog/regression
+   work, not as a prerequisite for Orin completion.
 
-### Phase 6: Arm / Orin Proof
+### Phase 7: External-VM/QEMU Compatibility Proof
 
-1. Clean build from workspace root:
-   `make mrproper`, `make orinagx_defconfig`, `make vm_qemu_virtio`.
-2. Submit through Autopilot using the canonical Orin AGX EFI chain.
-3. Preserve the known-good UARTI VM1 proof: VM1 output should still appear via
-   the platform-discovered UARTI source with `/bus@0/serial@31d0000` and INTID
-   `317`.
-4. Add the bidirectional guest UART proof separately: expose PL011 or the
-   selected guest UART model to Linux, route guest TX into an introspected
-   demuxed channel, inject RX from the demux/input side, and prove normal Linux
-   console interaction rather than only earlycon output.
-5. Confirm the Arm guest UART TX path uses the same producer-side buffering
-   policy: newline flush, capacity flush, and a configurable delayed flush with
-   `50 ms` as the starting default.
-6. Confirm the same guest UART model contract can be backed by QEMU when the VM
+1. Confirm the same guest UART model contract can be backed by QEMU when the VM
    is run outside the seL4 VMM path.
-7. Prove Autopilot consumes logical channel introspection rather than
-   hard-coded `tty0`/`tty1` stream assumptions.
-8. Only after that, evaluate whether UARTI remains useful as a separate
-   physical console or can be replaced by the muxed guest UART path.
+2. Confirm `qemu_arm64` can reuse the Orin-first mux/demux shape.
+3. Return to `qemu_x86_64` only after the Orin path is complete or when a
+   specific regression/customer need requires it.
 
-### Phase 7: Kconfig Off-Mode Proof
+### Phase 8: Kconfig Off-Mode Proof
 
 1. Build with the new mux Kconfig item enabled by default and confirm the
    generated mux path is active.
@@ -722,7 +752,8 @@ Real-run evidence from 2026-05-01:
 
 - The current x86 work tree contains uncommitted and untracked console routing
   docs/tools. Preserve those changes; do not "clean up" this topic by deleting
-  them as unrelated.
+  them as unrelated. x86 mux completion is backlog unless the Orin path needs a
+  specific shared fix from that code.
 - The older `console-transport-and-routing.md` still describes
   `binary_frames` as the target architecture. Treat that as stale, not
   compatibility debt.
