@@ -4,10 +4,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <plat/serial.h>
+
 import <PutChar.idl4>;
+import <GetChar.idl4>;
 import <Batch.idl4>;
+import <serial.camkes>;
 
 component ConsoleMux {
     provides Batch mux_batch;
-    uses Batch uplink_batch;
+    provides GetChar getchar;
+    maybe uses Batch uplink_batch;
+
+    HARDWARE_SERIAL_INTERFACES
+
+    composition {
+        HARDWARE_SERIAL_COMPOSITION
+    }
+
+    configuration {
+        HARDWARE_SERIAL_CONFIG
+    }
 }

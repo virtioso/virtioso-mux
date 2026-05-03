@@ -8,8 +8,30 @@ cmake_minimum_required(VERSION 3.8.2)
 
 project(ConsoleMux C)
 
+set(CONSOLE_MUX_SOURCES src/console_mux.c)
+set(CONSOLE_MUX_INCLUDES)
+
+if(DEFINED VIRTIO_CAMKES_STREAM_REGISTRY_SOURCE)
+    list(APPEND CONSOLE_MUX_SOURCES ${VIRTIO_CAMKES_STREAM_REGISTRY_SOURCE})
+    set_source_files_properties(
+        "${VIRTIO_CAMKES_STREAM_REGISTRY_SOURCE}"
+        PROPERTIES GENERATED TRUE
+    )
+endif()
+
+if(DEFINED VIRTIO_CAMKES_STREAM_REGISTRY_HEADER)
+    get_filename_component(
+        VIRTIO_CAMKES_STREAM_REGISTRY_INCLUDE
+        "${VIRTIO_CAMKES_STREAM_REGISTRY_HEADER}"
+        DIRECTORY
+    )
+    list(APPEND CONSOLE_MUX_INCLUDES ${VIRTIO_CAMKES_STREAM_REGISTRY_INCLUDE})
+endif()
+
 DeclareCAmkESComponent(
     ConsoleMux
     SOURCES
-    src/console_mux.c
+    ${CONSOLE_MUX_SOURCES}
+    INCLUDES
+    ${CONSOLE_MUX_INCLUDES}
 )

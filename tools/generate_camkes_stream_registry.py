@@ -18,6 +18,11 @@ from pathlib import Path
 COMPONENT_RE = re.compile(r"\bcomponent\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
 COMPONENT_DEF_RE = re.compile(r"\bcomponent\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 CAMKES_IMPORT_RE = re.compile(r"\bimport\s+<([^>]+)>;")
+CONNECTION_RE = re.compile(
+    r"\bconnection\s+[A-Za-z_][A-Za-z0-9_]*\s+[A-Za-z_][A-Za-z0-9_]*\s*"
+    r"\(\s*from\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+    r"to\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*;"
+)
 CONSOLE_INTERFACE_RE = re.compile(
     r"\b(?:maybe\s+)?(?:uses|provides)\s+(PutChar|GetChar)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
 )
@@ -214,6 +219,7 @@ def _stream_direction(interfaces):
 def _component_instances(preprocessed, component_types):
     composition = _composition_text(preprocessed)
     streams = []
+    stream_by_component = {}
     seen = set()
     next_stream_id = 1
     for match in COMPONENT_RE.finditer(composition):
@@ -229,20 +235,86 @@ def _component_instances(preprocessed, component_types):
             stream_id = _next_stream_id(next_stream_id)
             next_stream_id = stream_id + 1
             stream_id_source = "component.common.c"
-        streams.append(
-            {
-                "stream_id": stream_id,
-                "component": component_name,
-                "type": component_type,
-                "stream_id_source": stream_id_source,
-                "direction": _stream_direction(interfaces),
-                "interfaces": interfaces,
-                "aliases": [],
-            }
-        )
+        stream = {
+            "stream_id": stream_id,
+            "component": component_name,
+            "type": component_type,
+            "stream_id_source": stream_id_source,
+            "direction": _stream_direction(interfaces),
+            "interfaces": interfaces,
+            "aliases": [],
+        }
+        streams.append(stream)
+        stream_by_component[component_name] = stream
     if not streams:
         raise ValueError("no component instances found in assembly composition")
-    return streams
+    return streams, stream_by_component
+
+
+def _mux_sources(preprocessed, stream_by_component):
+    composition = _composition_text(preprocessed)
+    badges_by_target = {}
+    sources = []
+
+    for match in CONNECTION_RE.finditer(composition):
+        from_component, from_interface, to_component, to_interface = match.groups()
+        if to_interface != "mux_batch":
+            continue
+
+        target_key = (to_component, to_interface)
+        next_badge = badges_by_target.get(target_key, 1)
+        badges_by_target[target_key] = next_badge + 1
+
+        stream = stream_by_component.get(from_component)
+        if stream is None:
+            raise ValueError(f"mux source component '{from_component}' missing from registry")
+        if stream["stream_id"] < 0:
+            raise ValueError(f"mux source component '{from_component}' has no stream id")
+
+        sources.append(
+            {
+                "mux_component": to_component,
+                "mux_interface": to_interface,
+                "badge": next_badge,
+                "component": from_component,
+                "stream_id": stream["stream_id"],
+            }
+        )
+
+    return sources
+
+
+def _demux_sinks(preprocessed, stream_by_component):
+    composition = _composition_text(preprocessed)
+    badges_by_target = {}
+    sinks = []
+
+    for match in CONNECTION_RE.finditer(composition):
+        from_component, from_interface, to_component, to_interface = match.groups()
+        if to_interface != "getchar":
+            continue
+
+        target_key = (to_component, to_interface)
+        next_badge = badges_by_target.get(target_key, 1)
+        badges_by_target[target_key] = next_badge + 1
+
+        stream = stream_by_component.get(from_component)
+        if stream is None:
+            raise ValueError(f"demux sink component '{from_component}' missing from registry")
+        if stream["stream_id"] < 0:
+            raise ValueError(f"demux sink component '{from_component}' has no stream id")
+
+        sinks.append(
+            {
+                "demux_component": to_component,
+                "demux_interface": to_interface,
+                "badge": next_badge,
+                "component": from_component,
+                "stream_id": stream["stream_id"],
+            }
+        )
+
+    return sinks
 
 
 def _write_json(path, registry):
@@ -277,9 +349,31 @@ def _write_header(path, registry):
             "    const char *direction;",
             "};",
             "",
+            "struct virtioso_camkes_mux_source {",
+            "    uintptr_t badge;",
+            "    int32_t stream_id;",
+            "    const char *component;",
+            "    const char *mux_component;",
+            "    const char *mux_interface;",
+            "};",
+            "",
+            "struct virtioso_camkes_demux_sink {",
+            "    uintptr_t badge;",
+            "    int32_t stream_id;",
+            "    const char *component;",
+            "    const char *demux_component;",
+            "    const char *demux_interface;",
+            "};",
+            "",
             "extern const struct virtioso_camkes_stream_descriptor",
             "    virtioso_camkes_stream_registry[];",
             "extern const size_t virtioso_camkes_stream_registry_count;",
+            "extern const struct virtioso_camkes_mux_source",
+            "    virtioso_camkes_mux_sources[];",
+            "extern const size_t virtioso_camkes_mux_source_count;",
+            "extern const struct virtioso_camkes_demux_sink",
+            "    virtioso_camkes_demux_sinks[];",
+            "extern const size_t virtioso_camkes_demux_sink_count;",
             "extern const char virtioso_camkes_stream_registry_json[];",
             "",
             f"#endif /* {guard} */",
@@ -316,6 +410,52 @@ def _write_c(path, header_name, registry):
             "    sizeof(virtioso_camkes_stream_registry) /",
             "    sizeof(virtioso_camkes_stream_registry[0]);",
             "",
+            "const struct virtioso_camkes_mux_source",
+            "virtioso_camkes_mux_sources[] = {",
+        ]
+    )
+    for source in registry["mux_sources"]:
+        lines.append(
+            '    {%d, %d, "%s", "%s", "%s"},'
+            % (
+                source["badge"],
+                source["stream_id"],
+                source["component"],
+                source["mux_component"],
+                source["mux_interface"],
+            )
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "const size_t virtioso_camkes_mux_source_count =",
+            "    sizeof(virtioso_camkes_mux_sources) /",
+            "    sizeof(virtioso_camkes_mux_sources[0]);",
+            "",
+            "const struct virtioso_camkes_demux_sink",
+            "virtioso_camkes_demux_sinks[] = {",
+        ]
+    )
+    for sink in registry["demux_sinks"]:
+        lines.append(
+            '    {%d, %d, "%s", "%s", "%s"},'
+            % (
+                sink["badge"],
+                sink["stream_id"],
+                sink["component"],
+                sink["demux_component"],
+                sink["demux_interface"],
+            )
+        )
+    lines.extend(
+        [
+            "};",
+            "",
+            "const size_t virtioso_camkes_demux_sink_count =",
+            "    sizeof(virtioso_camkes_demux_sinks) /",
+            "    sizeof(virtioso_camkes_demux_sinks[0]);",
+            "",
             "const char virtioso_camkes_stream_registry_json[] =",
         ]
     )
@@ -338,12 +478,14 @@ def main(argv):
     preprocessed = _run_cpp(args)
     preprocessed_texts = _collect_preprocessed_camkes(args, preprocessed)
     component_types = _component_type_metadata(preprocessed_texts)
-    streams = _component_instances(preprocessed, component_types)
+    streams, stream_by_component = _component_instances(preprocessed, component_types)
     registry = {
         "schema": "virtioso.camkes_component_identity.v1",
         "name": args.name,
         "source": str(args.camkes),
         "streams": streams,
+        "mux_sources": _mux_sources(preprocessed, stream_by_component),
+        "demux_sinks": _demux_sinks(preprocessed, stream_by_component),
     }
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

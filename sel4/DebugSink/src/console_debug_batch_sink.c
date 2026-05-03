@@ -27,8 +27,14 @@ void raw_batch_batch(void)
         return;
     }
 
-    while (batch->head != batch->tail) {
+    if (batch->tail < batch->head || batch->tail > sizeof(batch->buf)) {
+        batch->head = 0;
+        batch->tail = 0;
+        return;
+    }
+
+    while (batch->head < batch->tail) {
         seL4_DebugPutChar((unsigned char)batch->buf[batch->head]);
-        batch->head = (batch->head + 1) % sizeof(batch->buf);
+        batch->head++;
     }
 }

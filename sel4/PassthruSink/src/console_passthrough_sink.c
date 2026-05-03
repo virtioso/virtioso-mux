@@ -119,10 +119,16 @@ void raw_batch_batch(void)
         return;
     }
 
+    if (batch->tail < batch->head || batch->tail > sizeof(batch->buf)) {
+        batch->head = 0;
+        batch->tail = 0;
+        return;
+    }
+
     start = console_sink_cycles_now();
-    while (batch->head != batch->tail) {
+    while (batch->head < batch->tail) {
         sink_putchar((unsigned char)batch->buf[batch->head]);
-        batch->head = (batch->head + 1) % sizeof(batch->buf);
+        batch->head++;
         payload_bytes++;
     }
 
