@@ -35,6 +35,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
@@ -74,18 +75,21 @@ int uucp_lock_tty_device(void);
 #define DEFAULT_TTY_DEVICE "/dev/ttyUSB3"
 #define UUCP_DIR "/var/lock"
 #define RAW_PTY "RAW"
+#define RAW_CCPLEX_PTY "raw_ccplex"
 #define AUTOPILOT_CONTROL_PTY "autopilot_control"
-#define DRIVER_VM_CONSOLE_PTY "driver_vm_console"
+#define PHYSICAL_UART_DEFAULT_PTY "physical_uart_default"
 #define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
+#define VIRTIOSO_DOWNLINK_FRAGMENT_PAYLOAD_SIZE 64
+#define VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS 1000
 #define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
 #define VIRTIOSO_OUTER_RAW 0
 #define VIRTIOSO_OUTER_NVIDIA_TCU 1
 #define VIRTIOSO_MAX_PTY_COUNT 257
 #define VIRTIOSO_CONTROL_IDLE 0
 #define VIRTIOSO_CONTROL_CMD 1
-#define VIRTIOSO_CONTROL_STREAM_ID 2
-#define VIRTIOSO_CONTROL_NAME_LEN 3
-#define VIRTIOSO_CONTROL_NAME 4
+#define VIRTIOSO_CONTROL_REGISTRY_LEN_HI 5
+#define VIRTIOSO_CONTROL_REGISTRY_LEN_LO 6
+#define VIRTIOSO_CONTROL_REGISTRY_JSON 7
 
 ut_static bool tcu_muxer_started = true; // Needed to exit endless while loops during testing
 ut_static const char* tty_device = DEFAULT_TTY_DEVICE;
@@ -100,10 +104,10 @@ static bool enable_write_raw_pty = false;
 static bool disable_uucp_lock = false;
 static bool virtioso_mode_enabled = false;
 static int virtioso_outer_mode = VIRTIOSO_OUTER_RAW;
-static char *virtioso_registry_path = NULL;
+static char *virtioso_registry_json = NULL;
 static char *virtioso_outer_tag_name = NULL;
 static int virtioso_outer_tag_idx = -1;
-static bool virtioso_wait_for_announce = false;
+static int raw_ccplex_pty_idx = -1;
 static int autopilot_control_pty_idx = -1;
 static int virtioso_default_pty_idx = -1;
 
@@ -114,7 +118,7 @@ struct tag {
 
 const struct tag chip_tags[] = {
     {
-        .name = "PSC",
+        .name = "CCPLEX",
         .value = 0xe1
     },
     {
@@ -170,7 +174,7 @@ const struct tag chip_tags[] = {
         .value = 0xf0
     },
     {
-        .name = "CCPLEX",
+        .name = "CCPLEX-ALT",
         .value = 0xe9
     }
 };
@@ -195,7 +199,7 @@ int patch2flush_stream(int fd, int tag, unsigned char ch, int *p_seen_n, int *p_
 void* tty_input_handler(void *arg);
 void* pty_input_handler(void* arg);
 void print_usage(char *argv[]);
-int load_virtioso_registry(const char *registry_path);
+int apply_virtioso_registry_json(const char *json);
 int create_pty_at_index(int pty_idx, const char *name, bool start_thread);
 int invalid_baudrate(int baudrate);
 speed_t get_baudrate(int baudrate);
@@ -215,6 +219,9 @@ struct thread_data tty_data;
 struct thread_data *pty_data;
 pthread_t *pty_thread;
 int pty_capacity;
+static pthread_mutex_t virtioso_downlink_ack_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t virtioso_downlink_ack_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int virtioso_downlink_ack_count;
 
 #define for_each_tags(tag_idx, tag) \
     for (tag_idx = 0, tag = &tags[tag_idx]; tag_idx < num_proc; tag_idx++, tag++)
@@ -232,47 +239,6 @@ static char *xstrndup(const char *src, size_t len)
     memcpy(dst, src, len);
     dst[len] = '\0';
     return dst;
-}
-
-static char *read_text_file(const char *path_arg, size_t *out_len)
-{
-    struct stat st;
-    char *buf;
-    FILE *f;
-    size_t len;
-
-    if (stat(path_arg, &st) != 0) {
-        fprintf(stderr, "ERROR: failed to stat %s: %s\n", path_arg, strerror(errno));
-        return NULL;
-    }
-    if (st.st_size < 0) {
-        fprintf(stderr, "ERROR: invalid file size for %s\n", path_arg);
-        return NULL;
-    }
-    len = (size_t)st.st_size;
-    buf = malloc(len + 1);
-    if (!buf) {
-        fprintf(stderr, "ERROR: failed to allocate %zu bytes for %s\n", len + 1, path_arg);
-        return NULL;
-    }
-    f = fopen(path_arg, "rb");
-    if (!f) {
-        fprintf(stderr, "ERROR: failed to open %s: %s\n", path_arg, strerror(errno));
-        free(buf);
-        return NULL;
-    }
-    if (fread(buf, 1, len, f) != len) {
-        fprintf(stderr, "ERROR: failed to read %s\n", path_arg);
-        fclose(f);
-        free(buf);
-        return NULL;
-    }
-    fclose(f);
-    buf[len] = '\0';
-    if (out_len) {
-        *out_len = len;
-    }
-    return buf;
 }
 
 static char *json_string_value_after(const char *start, const char *key)
@@ -338,6 +304,81 @@ static int json_int_value_after(const char *start, const char *key, int *out)
     return 0;
 }
 
+static const char *json_find_matching(const char *open, char open_ch, char close_ch)
+{
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    for (const char *pos = open; *pos != '\0'; pos++) {
+        char ch = *pos;
+
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == open_ch) {
+            depth++;
+        } else if (ch == close_ch) {
+            depth--;
+            if (depth == 0) {
+                return pos;
+            }
+        }
+    }
+    return NULL;
+}
+
+static const char *json_find_array_after(const char *start, const char *key, const char **array_end)
+{
+    const char *pos = strstr(start, key);
+
+    if (!pos) {
+        return NULL;
+    }
+    pos += strlen(key);
+    while (*pos && isspace((unsigned char)*pos)) {
+        pos++;
+    }
+    if (*pos != ':') {
+        return NULL;
+    }
+    pos++;
+    while (*pos && isspace((unsigned char)*pos)) {
+        pos++;
+    }
+    if (*pos != '[') {
+        return NULL;
+    }
+    *array_end = json_find_matching(pos, '[', ']');
+    if (!*array_end) {
+        return NULL;
+    }
+    return pos;
+}
+
+static const char *json_find_key_before(const char *start, const char *end, const char *key)
+{
+    const char *pos = start;
+
+    while ((pos = strstr(pos, key)) != NULL) {
+        if (pos >= end) {
+            return NULL;
+        }
+        return pos;
+    }
+    return NULL;
+}
+
 static int append_virtioso_stream(struct tag **stream_tags, int *count, int *capacity, int stream_id, char *name)
 {
     struct tag *new_tags;
@@ -395,28 +436,32 @@ static int init_virtioso_tags(void)
     if (!tags) {
         return -1;
     }
-    tags[0].name = AUTOPILOT_CONTROL_PTY;
+    tags[0].name = RAW_CCPLEX_PTY;
     tags[0].value = 0;
-    tags[1].name = DRIVER_VM_CONSOLE_PTY;
+    tags[1].name = AUTOPILOT_CONTROL_PTY;
     tags[1].value = 0;
-    num_proc = 2;
+    tags[2].name = PHYSICAL_UART_DEFAULT_PTY;
+    tags[2].value = 0;
+    num_proc = 3;
     default_tag_idx = 0;
     raw_pty_idx = 0;
-    autopilot_control_pty_idx = 0;
-    virtioso_default_pty_idx = 1;
+    raw_ccplex_pty_idx = 0;
+    autopilot_control_pty_idx = 1;
+    virtioso_default_pty_idx = 2;
     return 0;
 }
 
-int load_virtioso_registry(const char *registry_path)
+int apply_virtioso_registry_json(const char *json)
 {
-    char *json;
     const char *pos;
+    const char *streams_start;
+    const char *streams_end;
     struct tag *stream_tags = NULL;
     int stream_count = 0;
     int stream_capacity = 0;
     int builtin_count = 0;
 
-    if (init_virtioso_tags() != 0) {
+    if (!json) {
         return -1;
     }
     stream_tags = tags;
@@ -424,28 +469,41 @@ int load_virtioso_registry(const char *registry_path)
     builtin_count = num_proc;
     stream_capacity = VIRTIOSO_MAX_PTY_COUNT;
 
-    json = read_text_file(registry_path, NULL);
-    if (!json) {
+    streams_start = json_find_array_after(json, "\"streams\"", &streams_end);
+    if (!streams_start) {
+        fprintf(stderr, "ERROR: Virtioso registry has no streams array\n");
         return -1;
     }
-    pos = json;
-    while ((pos = strstr(pos, "\"stream_id\"")) != NULL) {
-        const char *object_end = strchr(pos, '}');
+    pos = streams_start + 1;
+    while (pos < streams_end) {
+        const char *object_start;
+        const char *object_end;
         const char *component_pos;
+        const char *stream_id_pos;
         int stream_id;
         char *name;
 
+        while (pos < streams_end && *pos != '{') {
+            pos++;
+        }
+        if (pos >= streams_end) {
+            break;
+        }
+        object_start = pos;
+        object_end = json_find_matching(object_start, '{', '}');
         if (!object_end) {
-            fprintf(stderr, "ERROR: malformed Virtioso registry near stream_id\n");
+            fprintf(stderr, "ERROR: malformed Virtioso stream object\n");
             goto fail;
         }
-        if (json_int_value_after(pos, "\"stream_id\"", &stream_id) != 0) {
-            fprintf(stderr, "ERROR: malformed Virtioso stream_id\n");
-            goto fail;
-        }
-        component_pos = strstr(pos, "\"component\"");
-        if (!component_pos || component_pos > object_end) {
+
+        component_pos = json_find_key_before(object_start, object_end, "\"component\"");
+        stream_id_pos = json_find_key_before(object_start, object_end, "\"stream_id\"");
+        if (!component_pos) {
             fprintf(stderr, "ERROR: malformed Virtioso component name\n");
+            goto fail;
+        }
+        if (!stream_id_pos || json_int_value_after(stream_id_pos, "\"stream_id\"", &stream_id) != 0) {
+            fprintf(stderr, "ERROR: malformed Virtioso stream_id\n");
             goto fail;
         }
         name = json_string_value_after(component_pos, "\"component\"");
@@ -459,22 +517,29 @@ int load_virtioso_registry(const char *registry_path)
         }
         pos = object_end + 1;
     }
-    free(json);
     if (stream_count == builtin_count) {
         fprintf(stderr, "ERROR: Virtioso registry has no valid streams\n");
         goto fail_no_json;
     }
     num_proc = stream_count;
     default_tag_idx = 0;
+    for (int i = builtin_count; i < num_proc; i++) {
+        if (create_pty_at_index(i, tags[i].name, true) != 0) {
+            goto fail_no_json;
+        }
+        pty_max_count = i + 1;
+    }
     return 0;
 
 fail:
-    free(json);
 fail_no_json:
     for (int i = builtin_count; i < stream_count; i++) {
         free(stream_tags[i].name);
+        stream_tags[i].name = NULL;
+        stream_tags[i].value = 0;
     }
-    free(stream_tags);
+    num_proc = builtin_count;
+    pty_max_count = builtin_count;
     return -1;
 }
 
@@ -482,6 +547,10 @@ static int find_chip_tag_idx_by_name(const char *name)
 {
     int tag_idx;
     const struct tag *tag;
+
+    if (strcmp(name, "PSC") == 0) {
+        name = "CCPLEX";
+    }
 
     for (tag_idx = 0, tag = &chip_tags[tag_idx];
          tag_idx < (int)(sizeof(chip_tags) / sizeof(chip_tags[0]));
@@ -506,83 +575,117 @@ static int find_virtioso_pty_idx_by_stream_id(unsigned char stream_id)
     return -1;
 }
 
-static void write_autopilot_control_stream_announce(unsigned char stream_id, const char *name)
+static void virtioso_note_downlink_ack(void)
 {
-    char event[(MAX_PATH * 2) + 128];
-    size_t pos = 0;
-    int prefix_len;
-
-    if (autopilot_control_pty_idx < 0 ||
-        autopilot_control_pty_idx >= pty_max_count ||
-        pty_data[autopilot_control_pty_idx].fd < 0) {
-        return;
-    }
-
-    prefix_len = snprintf(
-        event,
-        sizeof(event),
-        "{\"event\":\"stream_announce\",\"stream_id\":%u,\"name\":\"",
-        stream_id
-    );
-    if (prefix_len <= 0 || prefix_len >= (int)sizeof(event)) {
-        return;
-    }
-    pos = (size_t)prefix_len;
-    for (const char *p = name; *p != '\0' && pos + 3 < sizeof(event); p++) {
-        if (*p == '"' || *p == '\\') {
-            event[pos++] = '\\';
-        }
-        event[pos++] = *p;
-    }
-    if (pos + 3 >= sizeof(event)) {
-        return;
-    }
-    event[pos++] = '"';
-    event[pos++] = '}';
-    event[pos++] = '\n';
-
-    (void)write(pty_data[autopilot_control_pty_idx].fd, event, pos);
-    if (pty_data[autopilot_control_pty_idx].log_fd >= 0) {
-        (void)write(pty_data[autopilot_control_pty_idx].log_fd, event, pos);
-    }
+    pthread_mutex_lock(&virtioso_downlink_ack_lock);
+    virtioso_downlink_ack_count++;
+    pthread_cond_broadcast(&virtioso_downlink_ack_cond);
+    pthread_mutex_unlock(&virtioso_downlink_ack_lock);
 }
 
-static int append_announced_virtioso_stream(unsigned char stream_id, const char *name)
+static unsigned int virtioso_downlink_ack_snapshot(void)
 {
-    char *owned_name;
+    unsigned int count;
+
+    pthread_mutex_lock(&virtioso_downlink_ack_lock);
+    count = virtioso_downlink_ack_count;
+    pthread_mutex_unlock(&virtioso_downlink_ack_lock);
+    return count;
+}
+
+static int virtioso_wait_downlink_ack(unsigned int previous_count)
+{
+    struct timespec deadline;
+    int ret = 0;
+
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        return -1;
+    }
+    deadline.tv_sec += VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS / 1000;
+    deadline.tv_nsec += (long)(VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&virtioso_downlink_ack_lock);
+    while (virtioso_downlink_ack_count == previous_count && ret == 0) {
+        ret = pthread_cond_timedwait(&virtioso_downlink_ack_cond,
+                                     &virtioso_downlink_ack_lock,
+                                     &deadline);
+    }
+    pthread_mutex_unlock(&virtioso_downlink_ack_lock);
+
+    return ret == 0 ? 0 : -1;
+}
+
+static const char *virtioso_session_kind(const char *name)
+{
+    if (strcmp(name, AUTOPILOT_CONTROL_PTY) == 0 ||
+        strcmp(name, RAW_CCPLEX_PTY) == 0 ||
+        strcmp(name, PHYSICAL_UART_DEFAULT_PTY) == 0) {
+        return "virtioso_mux_builtin";
+    }
+    return "camkes_component_stream";
+}
+
+static void write_json_string(FILE *out, const char *value)
+{
+    fputc('"', out);
+    for (const char *p = value; *p != '\0'; p++) {
+        if (*p == '"' || *p == '\\') {
+            fputc('\\', out);
+            fputc(*p, out);
+        } else if (*p == '\n') {
+            fputs("\\n", out);
+        } else if (*p == '\r') {
+            fputs("\\r", out);
+        } else if (*p == '\t') {
+            fputs("\\t", out);
+        } else if ((unsigned char)*p < 0x20) {
+            fprintf(out, "\\u%04x", (unsigned char)*p);
+        } else {
+            fputc(*p, out);
+        }
+    }
+    fputc('"', out);
+}
+
+static void emit_virtioso_registry_record(void)
+{
+    if (!virtioso_registry_json) {
+        return;
+    }
+    fprintf(stdout, "{\"event\":\"stream_registry\",\"registry_json\":");
+    write_json_string(stdout, virtioso_registry_json);
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+static void emit_pty_session_record(int pty_idx, const char *name)
+{
+    struct thread_data *pty = &pty_data[pty_idx];
 
     if (!virtioso_mode_enabled) {
-        return -1;
+        fprintf(stdout, "%s\t%s\n", pty->device_name, name);
+        fflush(stdout);
+        return;
     }
-    if (stream_id == 0 ||
-        stream_id == VIRTIOSO_UART_PROTO_ESC_START ||
-        stream_id == VIRTIOSO_UART_PROTO_ESC_CONTROL) {
-        fprintf(stderr, "ERROR: invalid announced Virtioso stream id %u\n", stream_id);
-        return -1;
+
+    fprintf(stdout, "{\"event\":\"session_open\",\"name\":");
+    write_json_string(stdout, name);
+    fprintf(stdout, ",\"kind\":");
+    write_json_string(stdout, virtioso_session_kind(name));
+    fprintf(stdout, ",\"stream_id\":%u,\"pty_path\":", tags[pty_idx].value);
+    write_json_string(stdout, pty->device_name);
+    if (save_output_path) {
+        char savefile[1024];
+        snprintf(savefile, sizeof(savefile), "%s/%s.txt", save_output_path, name);
+        fprintf(stdout, ",\"log_path\":");
+        write_json_string(stdout, savefile);
     }
-    if (find_virtioso_pty_idx_by_stream_id(stream_id) >= 0) {
-        return 0;
-    }
-    if (num_proc >= pty_capacity || num_proc >= VIRTIOSO_MAX_PTY_COUNT) {
-        fprintf(stderr, "ERROR: no space for announced Virtioso stream %u\n", stream_id);
-        return -1;
-    }
-    owned_name = strdup(name);
-    if (!owned_name) {
-        return -1;
-    }
-    tags[num_proc].name = owned_name;
-    tags[num_proc].value = stream_id;
-    if (create_pty_at_index(num_proc, tags[num_proc].name, true) != 0) {
-        free(owned_name);
-        tags[num_proc].name = NULL;
-        tags[num_proc].value = 0;
-        return -1;
-    }
-    write_autopilot_control_stream_announce(stream_id, name);
-    num_proc++;
-    pty_max_count = num_proc;
-    return 0;
+    fputs("}\n", stdout);
+    fflush(stdout);
 }
 
 bool should_retry_io(ssize_t ret)
@@ -628,6 +731,11 @@ int putbuf_or_exit(int fd, const unsigned char *buf, size_t len)
         fprintf(stderr, "ERROR: failed to write bytes. Only %zd written but %zu requested\n",
             ret, len);
         return ret;
+    }
+
+    if (tcdrain(fd) < 0) {
+        fprintf(stderr, "ERROR: failed to drain TTY output - %s\n", strerror(errno));
+        return -1;
     }
 
     return 0;
@@ -769,10 +877,9 @@ static int feed_virtioso_byte(
     bool *in_escape,
     int *cur_rx_stream,
     int *control_state,
-    unsigned char *control_stream_id,
-    unsigned char *control_name_len,
-    unsigned char *control_name_pos,
-    char *control_name,
+    unsigned int *control_registry_len,
+    unsigned int *control_registry_pos,
+    char **control_registry_json,
     int *seen_n,
     int *seen_r
 )
@@ -782,33 +889,54 @@ static int feed_virtioso_byte(
     if (*control_state != VIRTIOSO_CONTROL_IDLE) {
         switch (*control_state) {
             case VIRTIOSO_CONTROL_CMD:
-                if (ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_ANNOUNCE) {
-                    *control_state = VIRTIOSO_CONTROL_STREAM_ID;
+                if (ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_REGISTRY) {
+                    *control_registry_len = 0;
+                    *control_registry_pos = 0;
+                    *control_state = VIRTIOSO_CONTROL_REGISTRY_LEN_HI;
+                } else if (ch == VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK) {
+                    virtioso_note_downlink_ack();
+                    *control_state = VIRTIOSO_CONTROL_IDLE;
                 } else {
                     *control_state = VIRTIOSO_CONTROL_IDLE;
                 }
                 break;
-            case VIRTIOSO_CONTROL_STREAM_ID:
-                *control_stream_id = ch;
-                *control_state = VIRTIOSO_CONTROL_NAME_LEN;
+            case VIRTIOSO_CONTROL_REGISTRY_LEN_HI:
+                *control_registry_len = ((unsigned int)ch) << 8;
+                *control_state = VIRTIOSO_CONTROL_REGISTRY_LEN_LO;
                 break;
-            case VIRTIOSO_CONTROL_NAME_LEN:
-                *control_name_len = ch;
-                *control_name_pos = 0;
-                if (*control_name_len == 0) {
+            case VIRTIOSO_CONTROL_REGISTRY_LEN_LO:
+                *control_registry_len |= ch;
+                *control_registry_pos = 0;
+                free(*control_registry_json);
+                *control_registry_json = NULL;
+                if (*control_registry_len == 0) {
                     *control_state = VIRTIOSO_CONTROL_IDLE;
-                } else {
-                    *control_state = VIRTIOSO_CONTROL_NAME;
+                    break;
                 }
+                *control_registry_json = calloc(*control_registry_len + 1, 1);
+                if (!*control_registry_json) {
+                    *control_state = VIRTIOSO_CONTROL_IDLE;
+                    break;
+                }
+                *control_state = VIRTIOSO_CONTROL_REGISTRY_JSON;
                 break;
-            case VIRTIOSO_CONTROL_NAME:
-                if (*control_name_pos < MAX_PATH - 1) {
-                    control_name[*control_name_pos] = (char)ch;
+            case VIRTIOSO_CONTROL_REGISTRY_JSON:
+                if (*control_registry_json && *control_registry_pos < *control_registry_len) {
+                    (*control_registry_json)[*control_registry_pos] = (char)ch;
                 }
-                (*control_name_pos)++;
-                if (*control_name_pos >= *control_name_len) {
-                    control_name[*control_name_len] = '\0';
-                    (void)append_announced_virtioso_stream(*control_stream_id, control_name);
+                (*control_registry_pos)++;
+                if (*control_registry_pos >= *control_registry_len) {
+                    if (virtioso_registry_json == NULL) {
+                        virtioso_registry_json = *control_registry_json;
+                        *control_registry_json = NULL;
+                        emit_virtioso_registry_record();
+                        if (apply_virtioso_registry_json(virtioso_registry_json) != 0) {
+                            return -1;
+                        }
+                    } else {
+                        free(*control_registry_json);
+                        *control_registry_json = NULL;
+                    }
                     *control_state = VIRTIOSO_CONTROL_IDLE;
                 }
                 break;
@@ -883,10 +1011,9 @@ static int feed_nvidia_outer_or_virtioso_raw(
     bool *virtioso_in_escape,
     int *cur_rx_stream,
     int *control_state,
-    unsigned char *control_stream_id,
-    unsigned char *control_name_len,
-    unsigned char *control_name_pos,
-    char *control_name,
+    unsigned int *control_registry_len,
+    unsigned int *control_registry_pos,
+    char **control_registry_json,
     int *seen_n,
     int *seen_r
 )
@@ -895,15 +1022,24 @@ static int feed_nvidia_outer_or_virtioso_raw(
     const struct tag *tag;
 
     if (virtioso_outer_mode == VIRTIOSO_OUTER_RAW) {
+        if (raw_ccplex_pty_idx >= 0 && raw_ccplex_pty_idx < pty_max_count) {
+            if (patch2flush_stream(
+                    pty_data[raw_ccplex_pty_idx].fd,
+                    raw_ccplex_pty_idx,
+                    ch,
+                    &seen_n[raw_ccplex_pty_idx],
+                    &seen_r[raw_ccplex_pty_idx]) != 0) {
+                return -1;
+            }
+        }
         return feed_virtioso_byte(
             ch,
             virtioso_in_escape,
             cur_rx_stream,
             control_state,
-            control_stream_id,
-            control_name_len,
-            control_name_pos,
-            control_name,
+            control_registry_len,
+            control_registry_pos,
+            control_registry_json,
             seen_n,
             seen_r
         );
@@ -918,10 +1054,9 @@ static int feed_nvidia_outer_or_virtioso_raw(
                     virtioso_in_escape,
                     cur_rx_stream,
                     control_state,
-                    control_stream_id,
-                    control_name_len,
-                    control_name_pos,
-                    control_name,
+                    control_registry_len,
+                    control_registry_pos,
+                    control_registry_json,
                     seen_n,
                     seen_r
                 );
@@ -950,15 +1085,24 @@ static int feed_nvidia_outer_or_virtioso_raw(
         return 0;
     }
     if (*cur_outer_tag == virtioso_outer_tag_idx) {
+        if (raw_ccplex_pty_idx >= 0 && raw_ccplex_pty_idx < pty_max_count) {
+            if (patch2flush_stream(
+                    pty_data[raw_ccplex_pty_idx].fd,
+                    raw_ccplex_pty_idx,
+                    ch,
+                    &seen_n[raw_ccplex_pty_idx],
+                    &seen_r[raw_ccplex_pty_idx]) != 0) {
+                return -1;
+            }
+        }
         return feed_virtioso_byte(
             ch,
             virtioso_in_escape,
             cur_rx_stream,
             control_state,
-            control_stream_id,
-            control_name_len,
-            control_name_pos,
-            control_name,
+            control_registry_len,
+            control_registry_pos,
+            control_registry_json,
             seen_n,
             seen_r
         );
@@ -1059,7 +1203,7 @@ ut_static int open_tty_device(void)
     struct termios options;
     struct stat sbuf;
     unsigned char chr;
-    int retries = 40;
+    int retries = 240;
 
     // use uucp locking if lock file directory is present
     // since minicom still uses it
@@ -1097,8 +1241,39 @@ ut_static int open_tty_device(void)
     tty_flock.l_whence = SEEK_SET;
     tty_flock.l_start = 0;
     tty_flock.l_len = 0;
-    if (fcntl(fd, F_SETLK, &tty_flock)) {
-        fprintf(stderr, "ERROR: TTY %s possibly locked by other uart_muxer instance!\n", tty_device);
+
+    retries = 240;
+    int lock_ret;
+    int lock_errno = 0;
+    do {
+        lock_ret = fcntl(fd, F_SETLK, &tty_flock);
+        if (lock_ret == 0) {
+            break;
+        }
+        lock_errno = errno;
+        if (errno != EACCES && errno != EAGAIN && errno != EINTR) {
+            close(fd);
+            fd = -1;
+            while ((fd = open(tty_device, O_RDWR|O_NOCTTY)) < 0) {
+                if (--retries < 0) {
+                    break;
+                }
+                usleep(50000);
+            }
+            if (fd < 0) {
+                break;
+            }
+        }
+        if (--retries < 0) {
+            break;
+        }
+        usleep(50000);
+    } while (true);
+    if (lock_ret != 0) {
+        fprintf(stderr,
+                "ERROR: TTY %s unavailable or locked by another instance: %s\n",
+                tty_device,
+                strerror(lock_errno ? lock_errno : errno));
         goto err;
     }
 
@@ -1176,10 +1351,9 @@ void* tty_input_handler(void *arg)
     int cur_rx_stream = -1;
     int cur_outer_tag = -1;
     int virtioso_control_state = VIRTIOSO_CONTROL_IDLE;
-    unsigned char virtioso_control_stream_id = 0;
-    unsigned char virtioso_control_name_len = 0;
-    unsigned char virtioso_control_name_pos = 0;
-    char virtioso_control_name[MAX_PATH];
+    unsigned int virtioso_control_registry_len = 0;
+    unsigned int virtioso_control_registry_pos = 0;
+    char *virtioso_control_registry_json = NULL;
     int tag_idx;
     const struct tag *tag;
 
@@ -1257,10 +1431,9 @@ void* tty_input_handler(void *arg)
                     &virtioso_in_escape,
                     &cur_rx_stream,
                     &virtioso_control_state,
-                    &virtioso_control_stream_id,
-                    &virtioso_control_name_len,
-                    &virtioso_control_name_pos,
-                    virtioso_control_name,
+                    &virtioso_control_registry_len,
+                    &virtioso_control_registry_pos,
+                    &virtioso_control_registry_json,
                     seen_n,
                     seen_r
                 );
@@ -1312,6 +1485,7 @@ not_escape_ch:
         }
     }
 out:
+    free(virtioso_control_registry_json);
     if (buf)
         free(buf);
     pthread_exit(NULL);
@@ -1337,21 +1511,42 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
             return 0;
         }
         pthread_mutex_lock(&tty_data.write_lock);
-        r = putbuf_or_exit(tty_data.fd, data, len);
+        if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
+            unsigned char *outer_buf = malloc((len * 2) + 2);
+            size_t outer_idx = 0;
+            if (!outer_buf) {
+                pthread_mutex_unlock(&tty_data.write_lock);
+                return -ENOMEM;
+            }
+            outer_buf[outer_idx++] = UART_PROTO_ESC_START;
+            outer_buf[outer_idx++] = chip_tags[virtioso_outer_tag_idx].value;
+            for (size_t data_index = 0; data_index < len; data_index++) {
+                unsigned char byte = data[data_index];
+                outer_buf[outer_idx++] = byte;
+                if (byte == UART_PROTO_ESC_START) {
+                    outer_buf[outer_idx++] = UART_PROTO_ESC_ESC;
+                }
+            }
+            r = putbuf_or_exit(tty_data.fd, outer_buf, outer_idx);
+            free(outer_buf);
+        } else {
+            r = putbuf_or_exit(tty_data.fd, data, len);
+        }
         pthread_mutex_unlock(&tty_data.write_lock);
         return (int)r;
     }
 
     pthread_mutex_lock(&tty_data.write_lock);
     while (processed < len) {
-        size_t chunk_size = (len - processed > MAX_WRITE_CHUNK_SIZE) ?
-                            MAX_WRITE_CHUNK_SIZE : (len - processed);
-        size_t inner_max = (chunk_size * 2) + 2;
+        size_t chunk_size = (len - processed > VIRTIOSO_DOWNLINK_FRAGMENT_PAYLOAD_SIZE) ?
+                            VIRTIOSO_DOWNLINK_FRAGMENT_PAYLOAD_SIZE : (len - processed);
+        size_t inner_max = (chunk_size * 2) + 4;
         size_t outer_max = (inner_max * 2) + 2;
         unsigned char *inner_buf = malloc(inner_max);
         unsigned char *outer_buf = malloc(outer_max);
         size_t inner_idx = 0;
         size_t outer_idx = 0;
+        unsigned int ack_before;
 
         if (!inner_buf || !outer_buf) {
             free(inner_buf);
@@ -1369,7 +1564,10 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
             }
             inner_buf[inner_idx++] = byte;
         }
+        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_START;
+        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_DEFAULT;
 
+        ack_before = virtioso_downlink_ack_snapshot();
         if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
             outer_buf[outer_idx++] = UART_PROTO_ESC_START;
             outer_buf[outer_idx++] = chip_tags[virtioso_outer_tag_idx].value;
@@ -1390,6 +1588,12 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
         if (r < 0) {
             pthread_mutex_unlock(&tty_data.write_lock);
             return (int)r;
+        }
+        if (virtioso_wait_downlink_ack(ack_before) != 0) {
+            fprintf(stderr, "ERROR: timed out waiting for Virtioso downlink ACK for stream %u\n",
+                    tags[pty_idx].value);
+            pthread_mutex_unlock(&tty_data.write_lock);
+            return -ETIMEDOUT;
         }
         processed += chunk_size;
     }
@@ -1707,8 +1911,7 @@ int create_pty_at_index(int pty_idx, const char *name, bool start_thread)
         tcsetattr(slave, TCSANOW, &options);
         close(slave);
     }
-    fprintf(stdout, "%s\t%s\n", pty->device_name, name);
-    fflush(stdout);
+    emit_pty_session_record(pty_idx, name);
 
     if (start_thread && create_thread_with_stack(&pty_thread[pty_idx], pty_input_handler, pty)) {
         fprintf(stderr, "ERROR: failed to spawn pty thread %d\n", pty_idx);
@@ -1743,10 +1946,8 @@ void print_usage(char *argv[])
             "Enable writing to RAW client\n");
     fprintf(stderr, "\t -L       : "
             "Disable UUCP lock file handling for router-managed PTYs\n");
-    fprintf(stderr, "\t -V <path>: "
-            "Enable Virtioso inner 0xfe demux using generated stream registry JSON\n");
     fprintf(stderr, "\t -A       : "
-            "Enable Virtioso inner 0xfe demux with autopilot_control and live stream announcements\n");
+            "Enable Virtioso inner 0xfe demux with target-provided stream registry control\n");
     fprintf(stderr, "\t -O <mode>: "
             "Virtioso outer input mode: raw or nvidia-tcu. Default: raw\n");
     fprintf(stderr, "\t -C <tag> : "
@@ -1764,7 +1965,7 @@ int main(int argc, char *argv[])
     size_t len;
     struct thread_data *pty;
 
-    while ((opt = getopt(argc, argv, ":d:r:s:l:p:V:O:C:AhitwL")) != -1) {
+    while ((opt = getopt(argc, argv, ":d:r:s:l:p:O:C:AhitwL")) != -1) {
         switch (opt)
         {
             case 'd':
@@ -1805,12 +2006,7 @@ int main(int argc, char *argv[])
             case 'p':
                 poll_output_timeout = atoi(optarg);
                 break;
-            case 'V':
-                virtioso_registry_path = optarg;
-                virtioso_mode_enabled = true;
-                break;
             case 'A':
-                virtioso_wait_for_announce = true;
                 virtioso_mode_enabled = true;
                 break;
             case 'O':
@@ -1841,16 +2037,7 @@ int main(int argc, char *argv[])
     }
 
     if (virtioso_mode_enabled) {
-        if (virtioso_registry_path) {
-            if (load_virtioso_registry(virtioso_registry_path) != 0) {
-                goto err;
-            }
-        } else if (virtioso_wait_for_announce) {
-            if (init_virtioso_tags() != 0) {
-                goto err;
-            }
-        } else {
-            fprintf(stderr, "ERROR: Virtioso mode requires -V <path> or -A\n");
+        if (init_virtioso_tags() != 0) {
             goto err;
         }
         if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {

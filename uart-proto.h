@@ -67,8 +67,11 @@
 /// Switches from normal stream selection to a Virtioso control record.
 #define VIRTIOSO_UART_PROTO_ESC_CONTROL 0xfdU
 
-/// Announces one generated CAmkES stream: STREAM_ANNOUNCE, id, name_len, name bytes.
-#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_ANNOUNCE 0x01U
+/// Announces the complete generated CAmkES stream registry: STREAM_REGISTRY, len_hi, len_lo, JSON bytes.
+#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_REGISTRY 0x02U
+
+/// Acknowledges that one complete host-to-target component-stream frame was accepted.
+#define VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK 0x03U
 
 /** @} */
 
