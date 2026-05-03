@@ -22,15 +22,18 @@
 #include "console_stream_ids.h"
 
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
+#define CONSOLE_MUX_REGISTRY_REPEAT_INTERVAL 16
 #define TCU_MUX_ESCAPE 0xfeU
 #define TCU_MUX_DEFAULT 0x00U
 #define TCU_MUX_CONTROL 0xfdU
 #define TCU_MUX_CONTROL_STREAM_REGISTRY 0x02U
+#define TCU_MUX_CONTROL_DOWNLINK_ACK 0x03U
 
 typedef struct console_mux_batch_buffer {
+    uint32_t stream_id;
     uint32_t head;
     uint32_t tail;
-    char buf[4096 - 8];
+    char buf[4096 - 12];
 } console_mux_batch_buffer_t;
 
 typedef struct console_mux_rpc_stats {
@@ -42,8 +45,17 @@ typedef struct console_mux_rpc_stats {
     uint64_t uplink_cycles;
 } console_mux_rpc_stats_t;
 
+typedef struct console_mux_downlink_stats {
+    uint64_t uart_bytes;
+    uint64_t payload_bytes;
+    uint64_t missing_sink_bytes;
+    uint64_t ring_full_bytes;
+    uint64_t unknown_stream_bytes;
+} console_mux_downlink_stats_t;
+
 static console_mux_rpc_stats_t console_mux_rpc_stats;
-static int console_mux_registry_emitted;
+static console_mux_downlink_stats_t console_mux_downlink_stats;
+static uint64_t console_mux_payload_frames;
 static char console_mux_frame[4096 - 8];
 static ps_io_ops_t console_mux_io_ops;
 static struct ps_chardevice console_mux_serial_device;
@@ -57,11 +69,11 @@ typedef struct console_mux_getchar_buffer {
     char buf[4096 - 8];
 } console_mux_getchar_buffer_t;
 
-void *getchar_buf(seL4_Word client_id) WEAK;
-void getchar_emit(unsigned int id) WEAK;
-unsigned int getchar_num_badges(void) WEAK;
+void vm0_getchar_foo(void)
+{
+}
 
-void getchar_foo(void)
+void vm1_getchar_foo(void)
 {
 }
 
@@ -72,16 +84,6 @@ static inline uint64_t console_mux_cycles_now(void)
 #else
     return 0;
 #endif
-}
-
-static const struct virtioso_camkes_mux_source *console_mux_source_for_badge(seL4_Word badge)
-{
-    for (size_t i = 0; i < virtioso_camkes_mux_source_count; i++) {
-        if (virtioso_camkes_mux_sources[i].badge == badge) {
-            return &virtioso_camkes_mux_sources[i];
-        }
-    }
-    return NULL;
 }
 
 static int console_mux_valid_stream_id(int stream_id)
@@ -112,9 +114,6 @@ static void console_mux_emit_registry(void)
     size_t len;
     uint32_t out = 0;
 
-    if (console_mux_registry_emitted) {
-        return;
-    }
     len = strlen(virtioso_camkes_stream_registry_json);
     if (len > 0xffff || len + 5 > sizeof(console_mux_frame)) {
         return;
@@ -129,7 +128,28 @@ static void console_mux_emit_registry(void)
     out += (uint32_t)len;
 
     console_mux_uplink_bytes(console_mux_frame, out);
-    console_mux_registry_emitted = 1;
+}
+
+static void console_mux_maybe_emit_registry(void)
+{
+    if ((console_mux_payload_frames % CONSOLE_MUX_REGISTRY_REPEAT_INTERVAL) == 0) {
+        console_mux_emit_registry();
+    }
+    console_mux_payload_frames++;
+}
+
+static void console_mux_emit_downlink_ack(int stream_id)
+{
+    char ack[3];
+
+    if (!console_mux_valid_stream_id(stream_id)) {
+        return;
+    }
+
+    ack[0] = TCU_MUX_ESCAPE;
+    ack[1] = TCU_MUX_CONTROL;
+    ack[2] = TCU_MUX_CONTROL_DOWNLINK_ACK;
+    console_mux_uplink_bytes(ack, sizeof(ack));
 }
 
 static void console_mux_emit_framed_payload(int stream_id, const char *bytes, uint32_t bytes_len)
@@ -140,7 +160,7 @@ static void console_mux_emit_framed_payload(int stream_id, const char *bytes, ui
         return;
     }
 
-    console_mux_emit_registry();
+    console_mux_maybe_emit_registry();
 
     console_mux_frame[out++] = TCU_MUX_ESCAPE;
     console_mux_frame[out++] = (char)stream_id;
@@ -172,6 +192,11 @@ static void console_mux_emit_report_line(const char *line)
     (void)line;
 }
 
+static int console_mux_is_power_of_two(uint64_t value)
+{
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
 static const struct virtioso_camkes_demux_sink *console_mux_sink_for_stream(int stream_id)
 {
     for (size_t i = 0; i < virtioso_camkes_demux_sink_count; i++) {
@@ -188,17 +213,35 @@ static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
     volatile console_mux_getchar_buffer_t *rx;
     uint32_t next_tail;
 
-    if (sink == NULL || getchar_buf == NULL || getchar_emit == NULL) {
+    if (sink == NULL || sink->buf == NULL || sink->emit == NULL) {
+        console_mux_downlink_stats.missing_sink_bytes++;
+        if (console_mux_is_power_of_two(console_mux_downlink_stats.missing_sink_bytes)) {
+            ZF_LOGW("ConsoleMux dropped downlink byte: missing sink stream=%d count=%llu",
+                    stream_id,
+                    (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
+        }
         return;
     }
 
-    rx = (volatile console_mux_getchar_buffer_t *)getchar_buf(sink->badge);
+    rx = (volatile console_mux_getchar_buffer_t *)sink->buf();
     if (rx == NULL) {
+        console_mux_downlink_stats.missing_sink_bytes++;
+        if (console_mux_is_power_of_two(console_mux_downlink_stats.missing_sink_bytes)) {
+            ZF_LOGW("ConsoleMux dropped downlink byte: null sink buffer stream=%d count=%llu",
+                    stream_id,
+                    (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
+        }
         return;
     }
 
     next_tail = (rx->tail + 1) % sizeof(rx->buf);
     if (next_tail == rx->head) {
+        console_mux_downlink_stats.ring_full_bytes++;
+        if (console_mux_is_power_of_two(console_mux_downlink_stats.ring_full_bytes)) {
+            ZF_LOGW("ConsoleMux dropped downlink byte: sink ring full stream=%d count=%llu",
+                    stream_id,
+                    (unsigned long long)console_mux_downlink_stats.ring_full_bytes);
+        }
         return;
     }
 
@@ -206,7 +249,8 @@ static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
     __sync_synchronize();
     rx->tail = next_tail;
     __sync_synchronize();
-    getchar_emit(sink->badge);
+    sink->emit();
+    console_mux_downlink_stats.payload_bytes++;
 }
 
 static void console_mux_feed_downlink_byte(uint8_t byte)
@@ -214,6 +258,7 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
     if (console_mux_rx_escape) {
         console_mux_rx_escape = 0;
         if (byte == TCU_MUX_DEFAULT) {
+            console_mux_emit_downlink_ack(console_mux_rx_stream);
             console_mux_rx_stream = -1;
             return;
         }
@@ -231,6 +276,12 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
             console_mux_rx_stream = byte;
         } else {
             console_mux_rx_stream = -1;
+            console_mux_downlink_stats.unknown_stream_bytes++;
+            if (console_mux_is_power_of_two(console_mux_downlink_stats.unknown_stream_bytes)) {
+                ZF_LOGW("ConsoleMux saw unknown downlink stream id=%u count=%llu",
+                        byte,
+                        (unsigned long long)console_mux_downlink_stats.unknown_stream_bytes);
+            }
         }
         return;
     }
@@ -256,6 +307,7 @@ static void console_mux_drain_uart(void)
     do {
         ch = ps_cdev_getchar(console_mux_serial);
         if (ch != EOF) {
+            console_mux_downlink_stats.uart_bytes++;
             console_mux_feed_downlink_byte((uint8_t)ch);
         }
     } while (ch != EOF);
@@ -328,13 +380,18 @@ seL4_Word mux_batch_get_sender_id(void) WEAK;
 void mux_batch_batch(void)
 {
     seL4_Word sender_id = mux_batch_get_sender_id();
-    const struct virtioso_camkes_mux_source *source = console_mux_source_for_badge(sender_id);
     console_mux_batch_buffer_t *batch =
         (console_mux_batch_buffer_t *)mux_batch_buf(sender_id);
+    int stream_id;
     uint32_t bytes_len;
     uint64_t start;
 
-    if (source == NULL || batch == NULL) {
+    if (batch == NULL) {
+        return;
+    }
+
+    stream_id = (int)batch->stream_id;
+    if (!console_mux_valid_stream_id(stream_id)) {
         return;
     }
 
@@ -348,7 +405,7 @@ void mux_batch_batch(void)
     }
 
     start = console_mux_cycles_now();
-    console_mux_emit_framed_payload(source->stream_id, &batch->buf[batch->head], bytes_len);
+    console_mux_emit_framed_payload(stream_id, &batch->buf[batch->head], bytes_len);
     console_mux_rpc_stats.server_calls++;
     console_mux_rpc_stats.server_payload_bytes += bytes_len;
     console_mux_rpc_stats.server_cycles += console_mux_cycles_now() - start;

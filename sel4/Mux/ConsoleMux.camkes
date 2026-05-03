@@ -13,7 +13,8 @@ import <serial.camkes>;
 
 component ConsoleMux {
     provides Batch mux_batch;
-    provides GetChar getchar;
+    provides GetChar vm0_getchar;
+    provides GetChar vm1_getchar;
     maybe uses Batch uplink_batch;
 
     HARDWARE_SERIAL_INTERFACES

@@ -24,9 +24,10 @@
 #endif
 
 typedef struct guest_console_sink_batch_buffer {
+    uint32_t stream_id;
     uint32_t head;
     uint32_t tail;
-    char buf[4096 - 8];
+    char buf[4096 - 12];
 } guest_console_sink_batch_buffer_t;
 
 typedef struct guest_console_sink_rpc_stats {
@@ -54,6 +55,7 @@ static guest_console_sink_batch_buffer_t *guest_console_sink_buffer(void)
 
 static void guest_console_sink_reset(guest_console_sink_batch_buffer_t *batch)
 {
+    batch->stream_id = (uint32_t)get_instance_console_stream_id();
     batch->head = 0;
     batch->tail = 0;
 }
@@ -159,6 +161,9 @@ static void guest_console_sink_emit_byte(uint8_t byte)
     }
 
     if (batch->tail < batch->head || batch->tail > sizeof(batch->buf)) {
+        guest_console_sink_reset(batch);
+    }
+    if ((int)batch->stream_id != get_instance_console_stream_id()) {
         guest_console_sink_reset(batch);
     }
 
