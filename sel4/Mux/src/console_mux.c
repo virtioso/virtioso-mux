@@ -48,6 +48,7 @@ typedef struct console_mux_rpc_stats {
 typedef struct console_mux_downlink_stats {
     uint64_t uart_bytes;
     uint64_t payload_bytes;
+    uint64_t delivered_frames;
     uint64_t missing_sink_bytes;
     uint64_t ring_full_bytes;
     uint64_t unknown_stream_bytes;
@@ -207,7 +208,7 @@ static const struct virtioso_camkes_demux_sink *console_mux_sink_for_stream(int 
     return NULL;
 }
 
-static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
+static int console_mux_enqueue_stream_byte(int stream_id, uint8_t byte)
 {
     const struct virtioso_camkes_demux_sink *sink = console_mux_sink_for_stream(stream_id);
     volatile console_mux_getchar_buffer_t *rx;
@@ -220,7 +221,7 @@ static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
         }
-        return;
+        return -1;
     }
 
     rx = (volatile console_mux_getchar_buffer_t *)sink->buf();
@@ -231,7 +232,7 @@ static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
         }
-        return;
+        return -1;
     }
 
     next_tail = (rx->tail + 1) % sizeof(rx->buf);
@@ -242,15 +243,27 @@ static void console_mux_deliver_stream_byte(int stream_id, uint8_t byte)
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.ring_full_bytes);
         }
-        return;
+        return -1;
     }
 
     rx->buf[rx->tail] = (char)byte;
     __sync_synchronize();
     rx->tail = next_tail;
     __sync_synchronize();
-    sink->emit();
     console_mux_downlink_stats.payload_bytes++;
+    return 0;
+}
+
+static void console_mux_emit_stream_ready(int stream_id)
+{
+    const struct virtioso_camkes_demux_sink *sink = console_mux_sink_for_stream(stream_id);
+
+    if (sink == NULL || sink->emit == NULL) {
+        return;
+    }
+
+    sink->emit();
+    console_mux_downlink_stats.delivered_frames++;
 }
 
 static void console_mux_feed_downlink_byte(uint8_t byte)
@@ -258,20 +271,23 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
     if (console_mux_rx_escape) {
         console_mux_rx_escape = 0;
         if (byte == TCU_MUX_DEFAULT) {
+            console_mux_emit_stream_ready(console_mux_rx_stream);
             console_mux_emit_downlink_ack(console_mux_rx_stream);
             console_mux_rx_stream = -1;
             return;
         }
         if (byte == TCU_MUX_ESCAPE) {
             if (console_mux_rx_stream >= 0) {
-                console_mux_deliver_stream_byte(console_mux_rx_stream, byte);
+                (void)console_mux_enqueue_stream_byte(console_mux_rx_stream, byte);
             }
             return;
         }
         if (byte == TCU_MUX_CONTROL) {
+            console_mux_emit_stream_ready(console_mux_rx_stream);
             console_mux_rx_stream = -1;
             return;
         }
+        console_mux_emit_stream_ready(console_mux_rx_stream);
         if (console_mux_sink_for_stream(byte) != NULL) {
             console_mux_rx_stream = byte;
         } else {
@@ -292,7 +308,7 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
     }
 
     if (console_mux_rx_stream >= 0) {
-        console_mux_deliver_stream_byte(console_mux_rx_stream, byte);
+        (void)console_mux_enqueue_stream_byte(console_mux_rx_stream, byte);
     }
 }
 
