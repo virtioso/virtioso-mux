@@ -261,18 +261,22 @@ static void console_mux_drain_uart(void)
     } while (ch != EOF);
 }
 
-static void console_mux_uart_irq_handle(void *data UNUSED,
-                                        ps_irq_acknowledge_fn_t acknowledge_fn,
-                                        void *ack_data)
+int serial_dev_irq_acknowledge(ps_irq_t *irq);
+
+static void console_mux_handle_uart_irq(void)
 {
     if (console_mux_serial != NULL) {
+        console_mux_drain_uart();
         ps_cdev_handle_irq(console_mux_serial, 0);
         console_mux_drain_uart();
     }
-    if (acknowledge_fn != NULL) {
-        int err = acknowledge_fn(ack_data);
-        ZF_LOGE_IF(err != 0, "ConsoleMux failed to acknowledge UARTI IRQ");
-    }
+}
+
+void serial_dev_irq_handle(ps_irq_t *irq)
+{
+    console_mux_handle_uart_irq();
+    int err = serial_dev_irq_acknowledge(irq);
+    ZF_LOGE_IF(err != 0, "ConsoleMux failed to acknowledge UARTI IRQ");
 }
 
 void pre_init(void)
@@ -288,15 +292,6 @@ void pre_init(void)
     ZF_LOGF_IF(console_mux_serial == NULL, "ConsoleMux failed to initialise UARTI");
 
     console_mux_serial->flags &= ~SERIAL_AUTO_CR;
-
-    ps_irq_t irq = { .type = PS_INTERRUPT, .irq = { .number = DEFAULT_SERIAL_INTERRUPT } };
-    irq_id_t irq_id = ps_irq_register(
-        &console_mux_io_ops.irq_ops,
-        irq,
-        console_mux_uart_irq_handle,
-        NULL
-    );
-    ZF_LOGF_IF(irq_id < 0, "ConsoleMux failed to register UARTI IRQ");
 }
 
 static void console_mux_report_rpc_stats(void)
