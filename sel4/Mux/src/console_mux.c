@@ -22,7 +22,6 @@
 #include "console_stream_ids.h"
 
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
-#define CONSOLE_MUX_REGISTRY_REPEAT_INTERVAL 16
 #define TCU_MUX_ESCAPE 0xfeU
 #define TCU_MUX_DEFAULT 0x00U
 #define TCU_MUX_CONTROL 0xfdU
@@ -56,7 +55,7 @@ typedef struct console_mux_downlink_stats {
 
 static console_mux_rpc_stats_t console_mux_rpc_stats;
 static console_mux_downlink_stats_t console_mux_downlink_stats;
-static uint64_t console_mux_payload_frames;
+static int console_mux_registry_emitted;
 static char console_mux_frame[4096 - 8];
 static ps_io_ops_t console_mux_io_ops;
 static struct ps_chardevice console_mux_serial_device;
@@ -133,10 +132,11 @@ static void console_mux_emit_registry(void)
 
 static void console_mux_maybe_emit_registry(void)
 {
-    if ((console_mux_payload_frames % CONSOLE_MUX_REGISTRY_REPEAT_INTERVAL) == 0) {
-        console_mux_emit_registry();
+    if (console_mux_registry_emitted) {
+        return;
     }
-    console_mux_payload_frames++;
+    console_mux_emit_registry();
+    console_mux_registry_emitted = 1;
 }
 
 static void console_mux_emit_downlink_ack(int stream_id)
