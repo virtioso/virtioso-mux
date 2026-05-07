@@ -121,24 +121,64 @@ async fn main() {
     }
     drop(tx); // rx closes when both forwarder tasks finish
 
-    while let Some(data) = rx.recv().await {
-        if conn.write_all(&data).await.is_err() {
-            eprintln!("virtioso-mux-exec: muxd socket write failed");
-            break;
+    // Monitor child exit on a background task so we can race it against the pipe drain.
+    // If a grandchild process inherits a pipe fd and outlives the child, the pipe reader
+    // tasks never see EOF.  We detect child exit and drain for at most 2 s then stop.
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<std::io::Result<std::process::ExitStatus>>();
+    tokio::spawn(async move {
+        let _ = exit_tx.send(child.wait().await);
+    });
+
+    let exit_code = drain_with_child_exit(&mut conn, &mut rx, exit_rx).await;
+
+    drop(conn); // signals CTRL_DISCONNECTED on daemon side
+    std::process::exit(exit_code);
+}
+
+async fn drain_with_child_exit(
+    conn: &mut UnixStream,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    mut exit_rx: tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+) -> i32 {
+    loop {
+        tokio::select! {
+            biased;
+            data = rx.recv() => {
+                match data {
+                    Some(data) => {
+                        if conn.write_all(&data).await.is_err() {
+                            eprintln!("virtioso-mux-exec: muxd socket write failed");
+                            return 1;
+                        }
+                    }
+                    None => {
+                        // Both pipe reader tasks finished cleanly; collect exit status.
+                        return match exit_rx.await {
+                            Ok(Ok(s)) => s.code().unwrap_or(1),
+                            _ => 1,
+                        };
+                    }
+                }
+            }
+            result = &mut exit_rx => {
+                // Child exited before both pipe readers finished (grandchild holding pipe?).
+                // Drain remaining buffered output for up to 2 s, then stop.
+                let code = match result {
+                    Ok(Ok(s)) => s.code().unwrap_or(1),
+                    _ => 1,
+                };
+                let deadline = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(2);
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(data)) => { let _ = conn.write_all(&data).await; }
+                        _ => break,
+                    }
+                }
+                return code;
+            }
         }
     }
-
-    // Closing conn signals CTRL_DISCONNECTED on the daemon side.
-    drop(conn);
-
-    let status = match child.wait().await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("virtioso-mux-exec: wait failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 async fn connect_with_retry(
