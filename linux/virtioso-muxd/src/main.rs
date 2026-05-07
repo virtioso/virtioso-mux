@@ -163,7 +163,9 @@ struct IdPool {
 impl IdPool {
     fn new() -> Self {
         let mut used = [false; 256];
-        used[0] = true; // 0 is reserved for control frames
+        used[0x00] = true; // reserved: control stream
+        used[0xfd] = true; // reserved: ESC_CONTROL byte in wire protocol
+        used[0xfe] = true; // reserved: ESC byte in wire protocol
         Self { next: 1, used }
     }
 
@@ -187,7 +189,7 @@ impl IdPool {
     }
 
     fn free(&mut self, id: u8) {
-        if id != 0 {
+        if id != 0x00 && id != 0xfd && id != 0xfe {
             self.used[id as usize] = false;
         }
     }
