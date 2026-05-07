@@ -35,10 +35,13 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/time.h>
-#include <time.h>
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include "uart-proto.h"
 
 struct reply_ctx {
@@ -79,8 +82,7 @@ int uucp_lock_tty_device(void);
 #define AUTOPILOT_CONTROL_PTY "autopilot_control"
 #define PHYSICAL_UART_DEFAULT_PTY "physical_uart_default"
 #define MAX_WRITE_CHUNK_SIZE 4096  // Maximum bytes to process at once (16KB encoded max)
-#define VIRTIOSO_DOWNLINK_FRAGMENT_PAYLOAD_SIZE 64
-#define VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS 1000
+#define VIRTIOSO_DOWNLINK_FRAGMENT_PAYLOAD_SIZE 512
 #define THREAD_STACK_SIZE (128 * 1024)  // 128KB stack per thread (sufficient for this application)
 #define VIRTIOSO_OUTER_RAW 0
 #define VIRTIOSO_OUTER_NVIDIA_TCU 1
@@ -90,6 +92,10 @@ int uucp_lock_tty_device(void);
 #define VIRTIOSO_CONTROL_REGISTRY_LEN_HI 5
 #define VIRTIOSO_CONTROL_REGISTRY_LEN_LO 6
 #define VIRTIOSO_CONTROL_REGISTRY_JSON 7
+/* States for CTRL_CONNECTED / CTRL_DISCONNECTED (virtioso-muxd dynamic streams) */
+#define VIRTIOSO_CONTROL_ANNOUNCE_LEN_HI 8
+#define VIRTIOSO_CONTROL_ANNOUNCE_LEN_LO 9
+#define VIRTIOSO_CONTROL_ANNOUNCE_PAYLOAD 10
 
 ut_static bool tcu_muxer_started = true; // Needed to exit endless while loops during testing
 ut_static const char* tty_device = DEFAULT_TTY_DEVICE;
@@ -220,8 +226,8 @@ struct thread_data *pty_data;
 pthread_t *pty_thread;
 int pty_capacity;
 static pthread_mutex_t virtioso_downlink_ack_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t virtioso_downlink_ack_cond = PTHREAD_COND_INITIALIZER;
 static unsigned int virtioso_downlink_ack_count;
+static bool virtioso_stream_input_enabled[VIRTIOSO_MAX_PTY_COUNT];
 
 #define for_each_tags(tag_idx, tag) \
     for (tag_idx = 0, tag = &tags[tag_idx]; tag_idx < num_proc; tag_idx++, tag++)
@@ -442,6 +448,9 @@ static int init_virtioso_tags(void)
     tags[1].value = 0;
     tags[2].name = PHYSICAL_UART_DEFAULT_PTY;
     tags[2].value = 0;
+    virtioso_stream_input_enabled[0] = true;
+    virtioso_stream_input_enabled[1] = true;
+    virtioso_stream_input_enabled[2] = true;
     num_proc = 3;
     default_tag_idx = 0;
     raw_pty_idx = 0;
@@ -479,9 +488,13 @@ int apply_virtioso_registry_json(const char *json)
         const char *object_start;
         const char *object_end;
         const char *component_pos;
+        const char *direction_pos;
         const char *stream_id_pos;
         int stream_id;
+        int stream_index;
         char *name;
+        char *direction = NULL;
+        bool input_enabled = false;
 
         while (pos < streams_end && *pos != '{') {
             pos++;
@@ -512,8 +525,19 @@ int apply_virtioso_registry_json(const char *json)
             fprintf(stderr, "ERROR: malformed Virtioso component name\n");
             goto fail;
         }
+        direction_pos = json_find_key_before(object_start, object_end, "\"direction\"");
+        if (direction_pos) {
+            direction = json_string_value_after(direction_pos, "\"direction\"");
+            input_enabled = direction &&
+                (strcmp(direction, "input") == 0 || strcmp(direction, "bidirectional") == 0);
+            free(direction);
+        }
+        stream_index = stream_count;
         if (append_virtioso_stream(&stream_tags, &stream_count, &stream_capacity, stream_id, name) != 0) {
             goto fail;
+        }
+        if (stream_count > stream_index) {
+            virtioso_stream_input_enabled[stream_index] = input_enabled;
         }
         pos = object_end + 1;
     }
@@ -524,7 +548,7 @@ int apply_virtioso_registry_json(const char *json)
     num_proc = stream_count;
     default_tag_idx = 0;
     for (int i = builtin_count; i < num_proc; i++) {
-        if (create_pty_at_index(i, tags[i].name, true) != 0) {
+        if (create_pty_at_index(i, tags[i].name, virtioso_stream_input_enabled[i]) != 0) {
             goto fail_no_json;
         }
         pty_max_count = i + 1;
@@ -579,44 +603,48 @@ static void virtioso_note_downlink_ack(void)
 {
     pthread_mutex_lock(&virtioso_downlink_ack_lock);
     virtioso_downlink_ack_count++;
-    pthread_cond_broadcast(&virtioso_downlink_ack_cond);
     pthread_mutex_unlock(&virtioso_downlink_ack_lock);
 }
 
-static unsigned int virtioso_downlink_ack_snapshot(void)
+/* Pending control type while accumulating ANNOUNCE payload bytes. */
+static unsigned char virtioso_pending_ctrl_type;
+
+static void apply_virtioso_stream_connected(unsigned char stream_id,
+                                            const char *name, unsigned int name_len)
 {
-    unsigned int count;
+    char name_buf[256];
+    unsigned int copy;
 
-    pthread_mutex_lock(&virtioso_downlink_ack_lock);
-    count = virtioso_downlink_ack_count;
-    pthread_mutex_unlock(&virtioso_downlink_ack_lock);
-    return count;
-}
+    if (find_virtioso_pty_idx_by_stream_id(stream_id) >= 0)
+        return; /* already registered */
 
-static int virtioso_wait_downlink_ack(unsigned int previous_count)
-{
-    struct timespec deadline;
-    int ret = 0;
-
-    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
-        return -1;
-    }
-    deadline.tv_sec += VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS / 1000;
-    deadline.tv_nsec += (long)(VIRTIOSO_DOWNLINK_ACK_TIMEOUT_MS % 1000) * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
+    if (num_proc >= pty_capacity) {
+        fprintf(stderr, "ERROR: PTY capacity exceeded for stream id %u\n", stream_id);
+        return;
     }
 
-    pthread_mutex_lock(&virtioso_downlink_ack_lock);
-    while (virtioso_downlink_ack_count == previous_count && ret == 0) {
-        ret = pthread_cond_timedwait(&virtioso_downlink_ack_cond,
-                                     &virtioso_downlink_ack_lock,
-                                     &deadline);
-    }
-    pthread_mutex_unlock(&virtioso_downlink_ack_lock);
+    copy = name_len < sizeof(name_buf) - 1 ? name_len : sizeof(name_buf) - 1;
+    memcpy(name_buf, name, copy);
+    name_buf[copy] = '\0';
 
-    return ret == 0 ? 0 : -1;
+    char *name_dup = xstrndup(name_buf, strlen(name_buf));
+    if (!name_dup)
+        return;
+
+    int pty_idx = num_proc;
+    tags[pty_idx].name = name_dup;
+    tags[pty_idx].value = stream_id;
+    virtioso_stream_input_enabled[pty_idx] = false; /* demux-only, no downlink */
+    num_proc++;
+    pty_max_count = num_proc;
+
+    if (create_pty_at_index(pty_idx, name_buf, false) != 0) {
+        free(name_dup);
+        tags[pty_idx].name = NULL;
+        tags[pty_idx].value = 0;
+        num_proc--;
+        pty_max_count = num_proc;
+    }
 }
 
 static const char *virtioso_session_kind(const char *name)
@@ -896,6 +924,12 @@ static int feed_virtioso_byte(
                 } else if (ch == VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK) {
                     virtioso_note_downlink_ack();
                     *control_state = VIRTIOSO_CONTROL_IDLE;
+                } else if (ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED ||
+                           ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_DISCONNECTED) {
+                    virtioso_pending_ctrl_type = ch;
+                    *control_registry_len = 0;
+                    *control_registry_pos = 0;
+                    *control_state = VIRTIOSO_CONTROL_ANNOUNCE_LEN_HI;
                 } else {
                     *control_state = VIRTIOSO_CONTROL_IDLE;
                 }
@@ -937,6 +971,44 @@ static int feed_virtioso_byte(
                         free(*control_registry_json);
                         *control_registry_json = NULL;
                     }
+                    *control_state = VIRTIOSO_CONTROL_IDLE;
+                }
+                break;
+            case VIRTIOSO_CONTROL_ANNOUNCE_LEN_HI:
+                *control_registry_len = ((unsigned int)ch) << 8;
+                *control_state = VIRTIOSO_CONTROL_ANNOUNCE_LEN_LO;
+                break;
+            case VIRTIOSO_CONTROL_ANNOUNCE_LEN_LO:
+                *control_registry_len |= ch;
+                *control_registry_pos = 0;
+                free(*control_registry_json);
+                *control_registry_json = NULL;
+                if (*control_registry_len == 0) {
+                    *control_state = VIRTIOSO_CONTROL_IDLE;
+                    break;
+                }
+                *control_registry_json = calloc(*control_registry_len + 1, 1);
+                if (!*control_registry_json) {
+                    *control_state = VIRTIOSO_CONTROL_IDLE;
+                    break;
+                }
+                *control_state = VIRTIOSO_CONTROL_ANNOUNCE_PAYLOAD;
+                break;
+            case VIRTIOSO_CONTROL_ANNOUNCE_PAYLOAD:
+                if (*control_registry_json && *control_registry_pos < *control_registry_len) {
+                    (*control_registry_json)[*control_registry_pos] = (char)ch;
+                }
+                (*control_registry_pos)++;
+                if (*control_registry_pos >= *control_registry_len) {
+                    if (virtioso_pending_ctrl_type == VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED
+                            && *control_registry_len >= 1 && *control_registry_json) {
+                        unsigned char sid = (unsigned char)(*control_registry_json)[0];
+                        const char *name = *control_registry_json + 1;
+                        unsigned int name_len = *control_registry_len - 1;
+                        apply_virtioso_stream_connected(sid, name, name_len);
+                    }
+                    free(*control_registry_json);
+                    *control_registry_json = NULL;
                     *control_state = VIRTIOSO_CONTROL_IDLE;
                 }
                 break;
@@ -1546,7 +1618,6 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
         unsigned char *outer_buf = malloc(outer_max);
         size_t inner_idx = 0;
         size_t outer_idx = 0;
-        unsigned int ack_before;
 
         if (!inner_buf || !outer_buf) {
             free(inner_buf);
@@ -1567,7 +1638,6 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
         inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_START;
         inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_DEFAULT;
 
-        ack_before = virtioso_downlink_ack_snapshot();
         if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
             outer_buf[outer_idx++] = UART_PROTO_ESC_START;
             outer_buf[outer_idx++] = chip_tags[virtioso_outer_tag_idx].value;
@@ -1588,12 +1658,6 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
         if (r < 0) {
             pthread_mutex_unlock(&tty_data.write_lock);
             return (int)r;
-        }
-        if (virtioso_wait_downlink_ack(ack_before) != 0) {
-            fprintf(stderr, "ERROR: timed out waiting for Virtioso downlink ACK for stream %u\n",
-                    tags[pty_idx].value);
-            pthread_mutex_unlock(&tty_data.write_lock);
-            return -ETIMEDOUT;
         }
         processed += chunk_size;
     }

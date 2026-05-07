@@ -73,6 +73,14 @@
 /// Acknowledges that one complete host-to-target component-stream frame was accepted.
 #define VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK 0x03U
 
+/// virtioso-muxd: a new mux-exec client connected; creates a PTY dynamically.
+/// Payload after len_hi/len_lo: [stream_id: u8] [name bytes...]
+#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED    0x01U
+
+/// virtioso-muxd: a mux-exec client disconnected; PTY is kept but receives no more data.
+/// Payload after len_hi/len_lo: [stream_id: u8]
+#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_DISCONNECTED 0x04U
+
 /** @} */
 
 #endif
