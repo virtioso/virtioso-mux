@@ -394,8 +394,8 @@ static int append_virtioso_stream(struct tag **stream_tags, int *count, int *cap
         return 0;
     }
     if (stream_id <= 0 || stream_id > 0xff ||
-        stream_id == VIRTIOSO_UART_PROTO_ESC_START ||
-        stream_id == VIRTIOSO_UART_PROTO_ESC_CONTROL) {
+        stream_id == VCMUX_PROTO_ESC_START ||
+        stream_id == VCMUX_PROTO_ESC_CONTROL) {
         fprintf(stderr, "ERROR: invalid Virtioso stream id %d for %s\n", stream_id, name);
         free(name);
         return -1;
@@ -917,15 +917,15 @@ static int feed_virtioso_byte(
     if (*control_state != VIRTIOSO_CONTROL_IDLE) {
         switch (*control_state) {
             case VIRTIOSO_CONTROL_CMD:
-                if (ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_REGISTRY) {
+                if (ch == VCMUX_PROTO_CONTROL_STREAM_REGISTRY) {
                     *control_registry_len = 0;
                     *control_registry_pos = 0;
                     *control_state = VIRTIOSO_CONTROL_REGISTRY_LEN_HI;
-                } else if (ch == VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK) {
+                } else if (ch == VCMUX_PROTO_CONTROL_DOWNLINK_ACK) {
                     virtioso_note_downlink_ack();
                     *control_state = VIRTIOSO_CONTROL_IDLE;
-                } else if (ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED ||
-                           ch == VIRTIOSO_UART_PROTO_CONTROL_STREAM_DISCONNECTED) {
+                } else if (ch == VCMUX_PROTO_CONTROL_STREAM_CONNECTED ||
+                           ch == VCMUX_PROTO_CONTROL_STREAM_DISCONNECTED) {
                     virtioso_pending_ctrl_type = ch;
                     *control_registry_len = 0;
                     *control_registry_pos = 0;
@@ -1000,7 +1000,7 @@ static int feed_virtioso_byte(
                 }
                 (*control_registry_pos)++;
                 if (*control_registry_pos >= *control_registry_len) {
-                    if (virtioso_pending_ctrl_type == VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED
+                    if (virtioso_pending_ctrl_type == VCMUX_PROTO_CONTROL_STREAM_CONNECTED
                             && *control_registry_len >= 1 && *control_registry_json) {
                         unsigned char sid = (unsigned char)(*control_registry_json)[0];
                         const char *name = *control_registry_json + 1;
@@ -1021,11 +1021,11 @@ static int feed_virtioso_byte(
 
     if (*in_escape) {
         *in_escape = false;
-        if (ch == VIRTIOSO_UART_PROTO_ESC_DEFAULT) {
+        if (ch == VCMUX_PROTO_ESC_DEFAULT) {
             *cur_rx_stream = -1;
             return 0;
         }
-        if (ch == VIRTIOSO_UART_PROTO_ESC_ESC) {
+        if (ch == VCMUX_PROTO_ESC_ESC) {
             if (*cur_rx_stream >= 0) {
                 return patch2flush_stream(
                     pty_data[*cur_rx_stream].fd,
@@ -1037,7 +1037,7 @@ static int feed_virtioso_byte(
             }
             return 0;
         }
-        if (ch == VIRTIOSO_UART_PROTO_ESC_CONTROL) {
+        if (ch == VCMUX_PROTO_ESC_CONTROL) {
             *control_state = VIRTIOSO_CONTROL_CMD;
             return 0;
         }
@@ -1050,7 +1050,7 @@ static int feed_virtioso_byte(
         return 0;
     }
 
-    if (ch == VIRTIOSO_UART_PROTO_ESC_START) {
+    if (ch == VCMUX_PROTO_ESC_START) {
         *in_escape = true;
         return 0;
     }
@@ -1626,17 +1626,17 @@ static int write_virtioso_data_to_uart(unsigned char pty_idx, const unsigned cha
             return -ENOMEM;
         }
 
-        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_START;
+        inner_buf[inner_idx++] = VCMUX_PROTO_ESC_START;
         inner_buf[inner_idx++] = tags[pty_idx].value;
         for (size_t data_index = 0; data_index < chunk_size; data_index++) {
             unsigned char byte = data[processed + data_index];
-            if (byte == VIRTIOSO_UART_PROTO_ESC_START) {
-                inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_ESC;
+            if (byte == VCMUX_PROTO_ESC_START) {
+                inner_buf[inner_idx++] = VCMUX_PROTO_ESC_ESC;
             }
             inner_buf[inner_idx++] = byte;
         }
-        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_START;
-        inner_buf[inner_idx++] = VIRTIOSO_UART_PROTO_ESC_DEFAULT;
+        inner_buf[inner_idx++] = VCMUX_PROTO_ESC_START;
+        inner_buf[inner_idx++] = VCMUX_PROTO_ESC_DEFAULT;
 
         if (virtioso_outer_mode == VIRTIOSO_OUTER_NVIDIA_TCU) {
             outer_buf[outer_idx++] = UART_PROTO_ESC_START;

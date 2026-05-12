@@ -50,36 +50,39 @@
 /** @} */
 
 /**
- * @defgroup virtioso_uart_protocol_codes Virtioso inner UART mux protocol codes
+ * @defgroup vcmux_protocol_codes Virtual Channel Mux (VCMux) protocol codes
  * @{
+ *
+ * VCMux is a transport-agnostic byte-stream multiplexer: multiple logical
+ * channels share one physical stream (UART, SSH, TCP) via 0xfe escape framing.
+ * This intentionally differs from NVIDIA's 0xff escape so VCMux streams can be
+ * carried inside a real NVIDIA TCU stream without collision.
  */
-/// Specifies the character to use as the beginning of a Virtioso inner mux
-/// escape sequence. This intentionally differs from NVIDIA's 0xff escape so
-/// Virtioso streams can be carried inside a real NVIDIA TCU stream.
-#define VIRTIOSO_UART_PROTO_ESC_START 0xfeU
+/// Escape byte that begins every VCMux framing sequence.
+#define VCMUX_PROTO_ESC_START 0xfeU
 
-/// Command sends the actual character that is being used for Virtioso ESC start.
-#define VIRTIOSO_UART_PROTO_ESC_ESC   0xfeU
+/// Escape for a literal 0xfe byte in payload data.
+#define VCMUX_PROTO_ESC_ESC   0xfeU
 
-/// Clears the active Virtioso component stream and returns to unframed/default output.
-#define VIRTIOSO_UART_PROTO_ESC_DEFAULT 0x00U
+/// Clears the active channel and returns to unframed/default output.
+#define VCMUX_PROTO_ESC_DEFAULT 0x00U
 
-/// Switches from normal stream selection to a Virtioso control record.
-#define VIRTIOSO_UART_PROTO_ESC_CONTROL 0xfdU
+/// Switches from channel-select mode to a VCMux control record.
+#define VCMUX_PROTO_ESC_CONTROL 0xfdU
 
 /// Announces the complete generated CAmkES stream registry: STREAM_REGISTRY, len_hi, len_lo, JSON bytes.
-#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_REGISTRY 0x02U
+#define VCMUX_PROTO_CONTROL_STREAM_REGISTRY 0x02U
 
 /// Acknowledges that one complete host-to-target component-stream frame was accepted.
-#define VIRTIOSO_UART_PROTO_CONTROL_DOWNLINK_ACK 0x03U
+#define VCMUX_PROTO_CONTROL_DOWNLINK_ACK 0x03U
 
 /// virtioso-muxd: a new mux-exec client connected; creates a PTY dynamically.
 /// Payload after len_hi/len_lo: [stream_id: u8] [name bytes...]
-#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_CONNECTED    0x01U
+#define VCMUX_PROTO_CONTROL_STREAM_CONNECTED    0x01U
 
 /// virtioso-muxd: a mux-exec client disconnected; PTY is kept but receives no more data.
 /// Payload after len_hi/len_lo: [stream_id: u8]
-#define VIRTIOSO_UART_PROTO_CONTROL_STREAM_DISCONNECTED 0x04U
+#define VCMUX_PROTO_CONTROL_STREAM_DISCONNECTED 0x04U
 
 /** @} */
 

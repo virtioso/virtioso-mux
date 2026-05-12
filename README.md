@@ -37,18 +37,19 @@ client. It handles the tag communication protocol below:
 `PSC` is accepted as a compatibility alias for `CCPLEX` because the Orin AGX
 CPU/UEFI/seL4 console payload is observed on tag `0xe1`.
 
-## Virtioso inner mux mode
+## Virtual Channel Mux (VCMux) mode
 
-The Virtioso fork can also demux a nested CAmkES console stream protocol. The
-runtime-introspection mode is enabled with `-A`.
+The Virtioso fork can also demux a nested CAmkES console stream using the
+Virtual Channel Mux (VCMux) protocol. The runtime-introspection mode is
+enabled with `-A`.
 
 The NVIDIA TCU protocol remains the outer protocol and keeps using `0xff`.
-Virtioso streams use an inner escape byte, `0xfe`, so the nested stream can be
+VCMux streams use an inner escape byte, `0xfe`, so the nested stream can be
 carried through a real NVIDIA TCU path without colliding with NVIDIA framing.
 
 Outer modes:
 
-    -O raw         input bytes are already the Virtioso 0xfe stream
+    -O raw         input bytes are already the VCMux 0xfe stream
     -O nvidia-tcu input bytes are a real NVIDIA TCU stream
 
 When `-O nvidia-tcu` is selected, `-C <tag>` chooses the NVIDIA client carrying
@@ -71,8 +72,8 @@ component stream PTYs:
   It is muxer-created transport state, not a generated CAmkES component stream.
 
 The `-A` runtime path waits for the seL4-side `ConsoleMux` to send the complete
-generated CAmkES stream registry over the mux control stream. Autopilot does
-not pass this registry to `tcu_muxer`; the registry is target-originated
+generated CAmkES stream registry over the VCMux control stream. Autopilot does
+not pass this registry to `vcmuxer`; the registry is target-originated
 runtime introspection data.
 
 The registry control record uses:
@@ -84,7 +85,7 @@ uses `0xfe <stream-id>`, and literal payload `0xfe` is escaped as `0xfe 0xfe`.
 `0xfe 0x00` clears the active generated component stream and returns following
 unframed bytes to `physical_uart_default`.
 
-When the registry arrives, `tcu_muxer` first reports it on stdout as a
+When the registry arrives, `vcmuxer` first reports it on stdout as a
 `stream_registry` event, then opens the component PTYs described by the
 registry:
 
