@@ -1,7 +1,7 @@
 // Wire protocol for virtioso-muxd — escape-sequence framing.
 //
-// Uses the same 0xfe/0xfd escape scheme as the CAmkES inner mux so that
-// tcu_muxer's -A mode handles both contexts without a separate parser.
+// Uses the same 0xfe/0xfd VCMux escape scheme as the CAmkES ConsoleMux so that
+// vcmuxer's -A mode handles both contexts without a separate parser.
 // See docs/architecture/virtioso-mux-wire-protocol.md for full details.
 //
 // Data frame:
