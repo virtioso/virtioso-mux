@@ -378,7 +378,7 @@ def _record_dynamic_mux_session(
         "pty": True,
         "raw_log": str(log_path),
         "events_log": None,
-        "source": "tcu_muxer_announcement",
+        "source": "vcmuxer_announcement",
     }
     (channel_dir / "channel.json").write_text(json.dumps(channel_payload, indent=2) + "\n")
     sessions[name] = {
@@ -410,7 +410,7 @@ def _mirror_log_growth(path: Path, offset: int, output_fd: int) -> int:
     return offset
 
 
-def _drain_tcu_muxer_mappings(
+def _drain_vcmuxer_mappings(
     runtime_dir: Path,
     sessions: dict[str, dict[str, Any]],
     logs_dir: Path,
@@ -440,15 +440,15 @@ def _drain_tcu_muxer_mappings(
         )
 
 
-def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[str]) -> int:
+def _run_virtioso_vcmux(manifest: Manifest, runtime_dir: Path, command: list[str]) -> int:
     transport = manifest.transport
-    tcu_muxer_path = Path(_transport_str(transport, "tcu_muxer_path")).expanduser().resolve()
-    if not tcu_muxer_path.exists():
-        raise ConsoleRouterError(f"tcu_muxer binary not found: {tcu_muxer_path}")
+    vcmuxer_path = Path(_transport_str(transport, "vcmuxer_path")).expanduser().resolve()
+    if not vcmuxer_path.exists():
+        raise ConsoleRouterError(f"vcmuxer binary not found: {vcmuxer_path}")
 
     runtime_dir.mkdir(parents=True, exist_ok=True)
     (runtime_dir / "runtime-manifest.json").write_text(json.dumps(_runtime_manifest_payload(manifest), indent=2) + "\n")
-    logs_dir = runtime_dir / "tcu_muxer_logs"
+    logs_dir = runtime_dir / "vcmuxer_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     sessions: dict[str, dict[str, Any]] = {}
     _write_dynamic_sessions_manifest(runtime_dir, sessions)
@@ -460,10 +460,10 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
     uart_slave_path = os.ttyname(uart_slave_fd)
     os.close(uart_slave_fd)
     uart_slave_fd = -1
-    tcu_stderr_path = runtime_dir / "tcu_muxer.stderr.log"
+    vcmuxer_stderr_path = runtime_dir / "vcmuxer.stderr.log"
 
-    tcu_cmd = [
-        str(tcu_muxer_path),
+    vcmuxer_cmd = [
+        str(vcmuxer_path),
         "-A",
         "-O",
         str(transport.get("outer", "raw")),
@@ -472,15 +472,15 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
         "-s",
         str(logs_dir),
         "-l",
-        str(runtime_dir / "tcu_muxer.raw.log"),
+        str(runtime_dir / "vcmuxer.raw.log"),
         "-L",
     ]
     outer_client = transport.get("outer_client")
     if isinstance(outer_client, str) and outer_client:
         tcu_cmd.extend(["-C", outer_client])
 
-    tcu_proc = subprocess.Popen(
-        tcu_cmd,
+    vcmuxer_proc = subprocess.Popen(
+        vcmuxer_cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -496,13 +496,13 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
         start_new_session=True,
     )
 
-    if proc.stdin is None or tcu_proc.stdout is None or tcu_proc.stderr is None:
-        raise ConsoleRouterError("failed to create virtioso_tcu_mux subprocess pipes")
+    if proc.stdin is None or vcmuxer_proc.stdout is None or vcmuxer_proc.stderr is None:
+        raise ConsoleRouterError("failed to create virtioso_vcmux subprocess pipes")
 
     _set_nonblocking(uart_master_fd)
     _set_nonblocking(proc.stdin.fileno())
-    _set_nonblocking(tcu_proc.stdout.fileno())
-    _set_nonblocking(tcu_proc.stderr.fileno())
+    _set_nonblocking(vcmuxer_proc.stdout.fileno())
+    _set_nonblocking(vcmuxer_proc.stderr.fileno())
     try:
         _set_nonblocking(sys.stdin.fileno())
     except OSError:
@@ -510,8 +510,8 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
 
     selector = selectors.DefaultSelector()
     selector.register(uart_master_fd, selectors.EVENT_READ, ("mux_to_proc", None))
-    selector.register(tcu_proc.stdout.fileno(), selectors.EVENT_READ, ("tcu_stdout", None))
-    selector.register(tcu_proc.stderr.fileno(), selectors.EVENT_READ, ("tcu_stderr", None))
+    selector.register(vcmuxer_proc.stdout.fileno(), selectors.EVENT_READ, ("vcmuxer_stdout", None))
+    selector.register(vcmuxer_proc.stderr.fileno(), selectors.EVENT_READ, ("vcmuxer_stderr", None))
     try:
         selector.register(sys.stdin.fileno(), selectors.EVENT_READ, ("stdin_in", None))
     except Exception:
@@ -541,11 +541,11 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
                     continue
                 if kind == "mux_to_proc":
                     _write_proc_input(proc.stdin.fileno(), data)
-                elif kind == "tcu_stdout":
-                    _drain_tcu_muxer_mappings(runtime_dir, sessions, logs_dir, mapping_buffer, data)
-                elif kind == "tcu_stderr":
+                elif kind == "vcmuxer_stdout":
+                    _drain_vcmuxer_mappings(runtime_dir, sessions, logs_dir, mapping_buffer, data)
+                elif kind == "vcmuxer_stderr":
                     os.write(sys.stderr.fileno(), data)
-                    with open(tcu_stderr_path, "ab", buffering=0) as f:
+                    with open(vcmuxer_stderr_path, "ab", buffering=0) as f:
                         f.write(data)
                 elif kind == "stdin_in":
                     _write_proc_input(proc.stdin.fileno(), data)
@@ -565,26 +565,26 @@ def _run_virtioso_tcu_mux(manifest: Manifest, runtime_dir: Path, command: list[s
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=5)
-        if tcu_proc.poll() is None:
-            tcu_proc.terminate()
-            tcu_proc.wait(timeout=5)
+        if vcmuxer_proc.poll() is None:
+            vcmuxer_proc.terminate()
+            vcmuxer_proc.wait(timeout=5)
 
     if mapping_buffer:
         os.write(sys.stdout.fileno(), bytes(mapping_buffer))
     raw_mirror_offset = _mirror_log_growth(raw_mirror_log, raw_mirror_offset, sys.stdout.fileno())
-    if return_code == 0 and tcu_proc.returncode not in {0, None, -15}:
-        return_code = tcu_proc.returncode
+    if return_code == 0 and vcmuxer_proc.returncode not in {0, None, -15}:
+        return_code = vcmuxer_proc.returncode
     return return_code
 
 
 def run_command(manifest_path: Path, runtime_dir: Path, command: list[str]) -> int:
     manifest = load_manifest(manifest_path)
     transport_type = manifest.transport.get("type")
-    if transport_type == "virtioso_tcu_mux":
-        return _run_virtioso_tcu_mux(manifest, runtime_dir, command)
+    if transport_type == "virtioso_vcmux":
+        return _run_virtioso_vcmux(manifest, runtime_dir, command)
     if transport_type != "process_stdio":
         raise ConsoleRouterError(
-            "run-command currently supports transport.type=process_stdio or virtioso_tcu_mux; "
+            "run-command currently supports transport.type=process_stdio or virtioso_vcmux; "
             f"got {transport_type!r}"
         )
     if len(manifest.channels) != 1:
