@@ -22,11 +22,11 @@
 #include "console_stream_ids.h"
 
 #define CONSOLE_MUX_RPC_REPORT_INTERVAL 16
-#define TCU_MUX_ESCAPE 0xfeU
-#define TCU_MUX_DEFAULT 0x00U
-#define TCU_MUX_CONTROL 0xfdU
-#define TCU_MUX_CONTROL_STREAM_REGISTRY 0x02U
-#define TCU_MUX_CONTROL_DOWNLINK_ACK 0x03U
+#define VCMUX_ESC 0xfeU
+#define VCMUX_DEFAULT 0x00U
+#define VCMUX_CTRL 0xfdU
+#define VCMUX_CTRL_STREAM_REGISTRY 0x02U
+#define VCMUX_CTRL_DOWNLINK_ACK 0x03U
 
 typedef struct console_mux_batch_buffer {
     uint32_t stream_id;
@@ -90,8 +90,8 @@ static int console_mux_valid_stream_id(int stream_id)
 {
     return stream_id > 0 &&
         stream_id <= 0xff &&
-        stream_id != TCU_MUX_ESCAPE &&
-        stream_id != TCU_MUX_CONTROL;
+        stream_id != VCMUX_ESC &&
+        stream_id != VCMUX_CTRL;
 }
 
 static void console_mux_uplink_bytes(const char *bytes, uint32_t bytes_len)
@@ -119,9 +119,9 @@ static void console_mux_emit_registry(void)
         return;
     }
 
-    console_mux_frame[out++] = TCU_MUX_ESCAPE;
-    console_mux_frame[out++] = TCU_MUX_CONTROL;
-    console_mux_frame[out++] = TCU_MUX_CONTROL_STREAM_REGISTRY;
+    console_mux_frame[out++] = VCMUX_ESC;
+    console_mux_frame[out++] = VCMUX_CTRL;
+    console_mux_frame[out++] = VCMUX_CTRL_STREAM_REGISTRY;
     console_mux_frame[out++] = (char)((len >> 8) & 0xff);
     console_mux_frame[out++] = (char)(len & 0xff);
     memcpy(&console_mux_frame[out], virtioso_camkes_stream_registry_json, len);
@@ -147,9 +147,9 @@ static void console_mux_emit_downlink_ack(int stream_id)
         return;
     }
 
-    ack[0] = TCU_MUX_ESCAPE;
-    ack[1] = TCU_MUX_CONTROL;
-    ack[2] = TCU_MUX_CONTROL_DOWNLINK_ACK;
+    ack[0] = VCMUX_ESC;
+    ack[1] = VCMUX_CTRL;
+    ack[2] = VCMUX_CTRL_DOWNLINK_ACK;
     console_mux_uplink_bytes(ack, sizeof(ack));
 }
 
@@ -163,18 +163,18 @@ static void console_mux_emit_framed_payload(int stream_id, const char *bytes, ui
 
     console_mux_maybe_emit_registry();
 
-    console_mux_frame[out++] = TCU_MUX_ESCAPE;
+    console_mux_frame[out++] = VCMUX_ESC;
     console_mux_frame[out++] = (char)stream_id;
     for (uint32_t i = 0; i < bytes_len; i++) {
         uint8_t byte = (uint8_t)bytes[i];
         if (out + 4 >= sizeof(console_mux_frame)) {
             console_mux_uplink_bytes(console_mux_frame, out);
             out = 0;
-            console_mux_frame[out++] = TCU_MUX_ESCAPE;
+            console_mux_frame[out++] = VCMUX_ESC;
             console_mux_frame[out++] = (char)stream_id;
         }
-        if (byte == TCU_MUX_ESCAPE) {
-            console_mux_frame[out++] = TCU_MUX_ESCAPE;
+        if (byte == VCMUX_ESC) {
+            console_mux_frame[out++] = VCMUX_ESC;
         }
         console_mux_frame[out++] = (char)byte;
     }
@@ -182,8 +182,8 @@ static void console_mux_emit_framed_payload(int stream_id, const char *bytes, ui
         console_mux_uplink_bytes(console_mux_frame, out);
         out = 0;
     }
-    console_mux_frame[out++] = TCU_MUX_ESCAPE;
-    console_mux_frame[out++] = TCU_MUX_DEFAULT;
+    console_mux_frame[out++] = VCMUX_ESC;
+    console_mux_frame[out++] = VCMUX_DEFAULT;
 
     console_mux_uplink_bytes(console_mux_frame, out);
 }
@@ -270,19 +270,19 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
 {
     if (console_mux_rx_escape) {
         console_mux_rx_escape = 0;
-        if (byte == TCU_MUX_DEFAULT) {
+        if (byte == VCMUX_DEFAULT) {
             console_mux_emit_stream_ready(console_mux_rx_stream);
             console_mux_emit_downlink_ack(console_mux_rx_stream);
             console_mux_rx_stream = -1;
             return;
         }
-        if (byte == TCU_MUX_ESCAPE) {
+        if (byte == VCMUX_ESC) {
             if (console_mux_rx_stream >= 0) {
                 (void)console_mux_enqueue_stream_byte(console_mux_rx_stream, byte);
             }
             return;
         }
-        if (byte == TCU_MUX_CONTROL) {
+        if (byte == VCMUX_CTRL) {
             console_mux_emit_stream_ready(console_mux_rx_stream);
             console_mux_rx_stream = -1;
             return;
@@ -302,7 +302,7 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
         return;
     }
 
-    if (byte == TCU_MUX_ESCAPE) {
+    if (byte == VCMUX_ESC) {
         console_mux_rx_escape = 1;
         return;
     }

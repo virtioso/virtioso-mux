@@ -39,7 +39,7 @@ path.
 
 The recommended direction is one shared, tiny TCU-style mux protocol above the
 producer boundary, with platform-specific UART attachment below it. It is not
-wire-compatible with NVIDIA `tcu_muxer`: our fork uses `0xfe` as its escape
+wire-compatible with NVIDIA `vcmuxer`: our fork uses `0xfe` as its escape
 byte so it can run on top of NVIDIA's real TCU stream without conflicting with
 NVIDIA's own `0xff` escape byte. x86 should use the current
 `GuestConsoleSink`/`ConsolePassthroughSink` work as an implementation
@@ -52,7 +52,7 @@ that registry instead of carrying manually assigned IDs.
 
 ### Common Protocol Baseline
 
-NVIDIA `tcu_muxer` provides the behavior shape to copy, but not the exact
+NVIDIA `vcmuxer` provides the behavior shape to copy, but not the exact
 escape byte:
 
 - NVIDIA uses `0xff` as its escape byte.
@@ -65,7 +65,7 @@ escape byte:
 
 The `0xfe` choice is intentional. It allows our muxed stream to travel through
 or alongside NVIDIA's real TCU tooling without making our escape byte
-ambiguous with NVIDIA `tcu_muxer` framing.
+ambiguous with NVIDIA `vcmuxer` framing.
 
 The required part for this workspace is generated stream identity,
 introspection, stream-switching, and byte escaping. NVIDIA's guest-name
@@ -281,11 +281,11 @@ The announcement must include at least:
 
 The forked demuxer must support two upstream UART shapes:
 
-- NVIDIA `tcu_muxer` is already between the real TCU UART and our demuxer. In
+- NVIDIA `vcmuxer` is already between the real TCU UART and our demuxer. In
   this mode, consume the stream already exposed by NVIDIA's tool and apply only
   our `0xfe` mux rules.
-- NVIDIA `tcu_muxer` is not present. In this mode, our demuxer must also do
-  the direct input/output work NVIDIA `tcu_muxer` normally performs, following
+- NVIDIA `vcmuxer` is not present. In this mode, our demuxer must also do
+  the direct input/output work NVIDIA `vcmuxer` normally performs, following
   the behavior in `sources/tcu_muxer/tcu_com.c`, while still using `0xfe` for
   our nested stream switching.
 
@@ -644,7 +644,7 @@ introspection exists.
 2. Confirm the mux announces stream IDs, CAmkES component names, directions,
    and aliases from the generated registry.
 3. Confirm the demux creates PTYs and logs from that announcement.
-4. Confirm the demuxer works when NVIDIA `tcu_muxer` is already present and
+4. Confirm the demuxer works when NVIDIA `vcmuxer` is already present and
    when our demuxer directly handles the real TCU UART path.
 5. Confirm no active path depends on `CF`, `binary_frames`, or `line_prefixes`.
 
@@ -681,7 +681,7 @@ the mux/demux work hostage.
 Initial implementation:
 `tools/console_router.py` now supports `transport.type = "virtioso_tcu_mux"`.
 For `vm_qemu_virtio` profiles, `tools/qemu_runner.py` writes a local runner
-manifest that starts `sources/tcu_muxer/tcu_muxer -A` and records dynamic
+manifest that starts `sources/tcu_muxer/vcmuxer -A` and records dynamic
 PTY/log sessions from stream announcements. Remote bundles deliberately keep
 their inner manifest as `process_stdio`; the local runner-side router demuxes
 the SSH stream so we do not run two demuxers in series.
@@ -777,7 +777,7 @@ introspection flow.
   exists, the duplicated IDs in x86 CAmkES and host Python are prohibited
   migration targets, not acceptable interim architecture.
 - Any implementation that accidentally uses `0xff` for our nested mux will
-  collide with NVIDIA `tcu_muxer` semantics and must be rejected.
+  collide with NVIDIA `vcmuxer` semantics and must be rejected.
 - Physical UART bootstrap discovery on Orin still needs a concrete owner. The
   plan should move `/dev/ttyACM*` knowledge out of Autopilot chains, but some
   platform inventory or daemon layer must still identify the physical serial

@@ -69,7 +69,7 @@ it must not become the semantic identity of any VM console.
 4. Update Autopilot after target proof.
    - `tty0` remains raw CCPLEX.
    - `tty1` becomes the physical mux carrier.
-   - Start host `tcu_muxer` inside each Autopilot run, not at daemon startup,
+   - Start host `vcmuxer` inside each Autopilot run, not at daemon startup,
      so stream PTYs and logs live under that run's `console/console-runtime/`
      directory and never accumulate in a shared runtime directory.
    - Login input must target logical stream names such as `vm0`, not
@@ -90,7 +90,7 @@ Proof criteria:
 
 - `ttyACM0` still captures raw CCPLEX boot and recovery output.
 - `ttyACM1` receives the target-generated stream registry.
-- Host `tcu_muxer` creates logical PTYs/logs from that registry.
+- Host `vcmuxer` creates logical PTYs/logs from that registry.
 - Those PTYs/logs are per-run artifacts under
   `results/<request>/console/console-runtime/`, not daemon-global state.
 - Writing `root\n` to the `vm0` logical stream produces a VM0 shell prompt on
@@ -106,6 +106,6 @@ Proof criteria:
   SBSA/PL011-compatible register model used by the local DT.
 - Autopilot must stop treating `tty1` as `VM1`; after this change `tty1` is a
   mux carrier whose logical sessions are announced at runtime.
-- A daemon-level `tcu_muxer` makes stream logs cross-run state and should not be
+- A daemon-level `vcmuxer` makes stream logs cross-run state and should not be
   used for normal validation. If a wrapper is used, it should only preserve the
   physical UART contract and report that the muxer lifecycle is per-run.

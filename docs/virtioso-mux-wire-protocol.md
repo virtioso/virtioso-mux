@@ -1,7 +1,7 @@
 # Virtioso Mux Wire Protocol
 
 This document describes the binary framing used on the UART link between
-isengard (Orin AGX) and the Autopilot host, and how `tcu_muxer` demultiplexes
+isengard (Orin AGX) and the Autopilot host, and how `vcmuxer` demultiplexes
 the individual streams.  It covers both the CAmkES-side mux and the Linux-side
 `virtioso-muxd` mux, which share the same wire format.
 
@@ -12,8 +12,8 @@ isengard (seL4 / Linux)                   Autopilot host
   UARTI (0x31d0000)
     ↓ /dev/ttyAMA0  (inside isengard)
     ↓ ttyACM1       (USB-serial on host)
-    ↓ tcu_muxer -d /dev/ttyACM1
-      ├── raw_ccplex PTY    ← all bytes before the Virtioso inner mux starts
+    ↓ vcmuxer -d /dev/ttyACM1
+      ├── raw_ccplex PTY    ← all bytes before the Virtual Channel Mux (VCMux) starts
       ├── physical_uart_default PTY
       ├── autopilot_control PTY
       └── <stream name> PTY (one per mux-exec client or CAmkES component)
@@ -30,13 +30,13 @@ subsystem's output in NVIDIA's own escape scheme:
 | `0xff` `0xff` | Literal `0xff` in current subsystem |
 | `0xff` `0xfd` | System-level reset |
 
-`tcu_muxer` decodes this layer when started with `-O nvidia-tcu -C CCPLEX`.
+`vcmuxer` decodes this layer when started with `-O nvidia-tcu -C CCPLEX`.
 The CCPLEX payload is then fed to the Virtioso inner layer.
 
 `ttyACM1` (UARTI / ttyAMA0) is **raw** — no NVIDIA outer wrapping. Start
-`tcu_muxer` with `-O raw` (the default) for this port.
+`vcmuxer` with `-O raw` (the default) for this port.
 
-## Layer 1 — Virtioso inner mux protocol (0xfe / 0xfd)
+## Layer 1 — Virtual Channel Mux (VCMux) protocol (0xfe / 0xfd)
 
 Both the **CAmkES** mux (seL4 side) and **virtioso-muxd** (Linux side) use the
 same escape-sequence framing on the wire.  `0xfe` and `0xfd` are owned by
@@ -79,7 +79,7 @@ Carries the client's chosen name and the stream ID allocated for it:
 [0xfe] [0xfd] [0x01] [len_hi] [len_lo] [stream_id] [name bytes…]
 ```
 
-`tcu_muxer` responds by creating a new PTY for `stream_id` with the given
+`vcmuxer` responds by creating a new PTY for `stream_id` with the given
 name and emitting a `session_open` JSON record to stdout.
 
 #### CTRL_DISCONNECTED (0x04)
@@ -109,7 +109,7 @@ JSON format:
 ]}
 ```
 
-`tcu_muxer` applies the registry and creates PTYs for all listed streams.
+`vcmuxer` applies the registry and creates PTYs for all listed streams.
 
 #### DOWNLINK_ACK (0x03)
 
@@ -122,14 +122,14 @@ Any `0xfe` byte appearing in stream payload must be sent as `0xfe 0xfe`.
 The demuxer, when in "in-stream" state (after `0xfe S`, before `0xfe 0x00`),
 interprets `0xfe 0xfe` as a single literal `0xfe` byte.
 
-## tcu_muxer modes
+## vcmuxer modes
 
-`tcu_muxer` is the C binary at `sources/tcu_muxer/`.
+`vcmuxer` is the C binary at `sources/tcu_muxer/`.
 
 | Flag | Effect |
 |------|--------|
 | *(none)* | Legacy NVIDIA TCU outer-only mode; one PTY per subsystem tag |
-| `-A` | Virtioso inner mux mode; reads STREAM_REGISTRY or CTRL_CONNECTED to build the PTY table dynamically |
+| `-A` | Virtual Channel Mux (VCMux) mode; reads STREAM_REGISTRY or CTRL_CONNECTED to build the PTY table dynamically |
 | `-O raw` | Outer layer is raw (default); use for ttyACM1 / ttyAMA0 |
 | `-O nvidia-tcu -C CCPLEX` | Outer layer is NVIDIA TCU; use for ttyACM0 |
 | `-s <dir>` | Write per-stream log files to `<dir>/<name>.txt` |
@@ -138,12 +138,12 @@ interprets `0xfe 0xfe` as a single literal `0xfe` byte.
 Typical invocation for the UARTI / `virtioso-muxd` path:
 
 ```bash
-tcu_muxer -A -O raw -d /dev/ttyACM1 -s /tmp/mux-streams
+vcmuxer -A -O raw -d /dev/ttyACM1 -s /tmp/mux-streams
 ```
 
 ### PTY session records
 
-In `-A` mode `tcu_muxer` emits one JSON line to stdout per PTY created:
+In `-A` mode `vcmuxer` emits one JSON line to stdout per PTY created:
 
 ```json
 {"event":"session_open","name":"zenoh_demo","kind":"camkes_component_stream",
@@ -172,7 +172,7 @@ virtioso-mux-exec --name zenoh_demo -- sh -c 'isengard-demo-zenoh-remote ...'
    ↓ Unix socket /run/virtioso-mux/control.sock
 virtioso-muxd
    ↓ --sink uart:/dev/ttyAMA0   (or file: or tcp:)
-tcu_muxer on host
+vcmuxer on host
 ```
 
 ### Stream lifecycle
@@ -211,5 +211,5 @@ to avoid sharing the UART with the Autopilot console reader.
 virtioso-mux-exec --name my_stream -- my_program args...
 ```
 
-`tcu_muxer` will create `/dev/pts/N` and write to `/tmp/mux-streams/my_stream.txt`
-as soon as the CTRL_CONNECTED frame arrives.  No restart of tcu_muxer needed.
+`vcmuxer` will create `/dev/pts/N` and write to `/tmp/mux-streams/my_stream.txt`
+as soon as the CTRL_CONNECTED frame arrives.  No restart of vcmuxer needed.
