@@ -221,5 +221,4 @@ See the VCMux section of the Virtioso plan doc for detailed mitigations.
 ## Related Documents
 
 - `virtioso-mux-wire-protocol.md` — detailed frame-by-frame protocol spec
-- `console-mux-camkes-architecture-plan-2026-04-25.md` — CAmkES ConsoleMux design
 - `cross-arch-tcu-uart-mux-plan-2026-05-01.md` — cross-architecture planning

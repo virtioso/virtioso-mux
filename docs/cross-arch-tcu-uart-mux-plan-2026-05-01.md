@@ -16,10 +16,6 @@ not block finishing the Orin CAmkES component mux/demux path.
 
 Related notes:
 
-- [console-mux-nvidia-style-rewrite-plan-2026-04-27.md](console-mux-nvidia-style-rewrite-plan-2026-04-27.md)
-- [console-mux-camkes-architecture-plan-2026-04-25.md](console-mux-camkes-architecture-plan-2026-04-25.md)
-- [console-transport-and-routing.md](console-transport-and-routing.md)
-- [../integration/x86-vm-qemu-virtio-console-stream-inventory-2026-04-24.md](../integration/x86-vm-qemu-virtio-console-stream-inventory-2026-04-24.md)
 - [../integration/orinagx-vm-qemu-virtio-crossvm-irq-analysis-2026-02-09.md](../integration/orinagx-vm-qemu-virtio-crossvm-irq-analysis-2026-02-09.md)
 - [../platforms/orin-agx/investigations/tcu-console-sporadic-hang.md](../platforms/orin-agx/investigations/tcu-console-sporadic-hang.md)
 
@@ -754,9 +750,6 @@ introspection flow.
   docs/tools. Preserve those changes; do not "clean up" this topic by deleting
   them as unrelated. x86 mux completion is backlog unless the Orin path needs a
   specific shared fix from that code.
-- The older `console-transport-and-routing.md` still describes
-  `binary_frames` as the target architecture. Treat that as stale, not
-  compatibility debt.
 - The PL011 emulator cannot currently receive guest input. A muxed PL011 output
   proof is not enough; the target is a bidirectional Linux console device model
   with TX, RX, status, and interrupt behavior.
