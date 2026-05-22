@@ -1,0 +1,29 @@
+/*
+ * Copyright 2026, Unikie
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import <GetChar.idl4>;
+import <PutChar.idl4>;
+import <Batch.idl4>;
+import <serial.camkes>;
+
+component ConsolePassthroughSink {
+    control;
+    provides PutChar processed_putchar;
+    provides PutChar raw_putchar;
+    provides Batch raw_batch;
+    provides GetChar getchar;
+
+    uses IOPort serial_port;
+
+    composition {
+        component Serial hw_serial;
+        connection seL4HardwareIOPort serial_ioport(from serial_port, to hw_serial.serial);
+    }
+
+    configuration {
+        hw_serial.serial_attributes <- serial_attributes;
+    }
+}

@@ -1,0 +1,11 @@
+/*
+ * Copyright 2026, Unikie
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import <Batch.idl4>;
+
+component ConsoleDebugBatchSink {
+    provides Batch raw_batch;
+}
