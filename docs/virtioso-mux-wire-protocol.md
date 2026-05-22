@@ -124,7 +124,7 @@ interprets `0xfe 0xfe` as a single literal `0xfe` byte.
 
 ## virtioso-mux modes
 
-`virtioso-mux` is the C binary at `sources/tcu_muxer/`.
+`virtioso-mux` is the C binary at `sources/virtioso-mux/host/`.
 
 | Flag | Effect |
 |------|--------|
