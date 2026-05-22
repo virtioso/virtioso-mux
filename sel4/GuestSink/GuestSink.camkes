@@ -3,6 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#pragma once
+#ifndef VIRTIOSO_MUX_SEL4_GUESTSINK_CAMKES
+#define VIRTIOSO_MUX_SEL4_GUESTSINK_CAMKES
+
 
 import <PutChar.idl4>;
 import <Batch.idl4>;
@@ -11,3 +15,5 @@ component GuestSink {
     provides PutChar guest_putchar;
     uses Batch mux_batch;
 }
+
+#endif /* VIRTIOSO_MUX_SEL4_GUESTSINK_CAMKES */

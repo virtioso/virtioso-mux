@@ -3,9 +3,15 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#pragma once
+#ifndef VIRTIOSO_MUX_SEL4_DEBUGSINK_CAMKES
+#define VIRTIOSO_MUX_SEL4_DEBUGSINK_CAMKES
+
 
 import <Batch.idl4>;
 
 component DebugSink {
     provides Batch raw_batch;
 }
+
+#endif /* VIRTIOSO_MUX_SEL4_DEBUGSINK_CAMKES */

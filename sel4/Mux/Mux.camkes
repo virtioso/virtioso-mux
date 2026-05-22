@@ -3,6 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#pragma once
+#ifndef VIRTIOSO_MUX_SEL4_MUX_CAMKES
+#define VIRTIOSO_MUX_SEL4_MUX_CAMKES
+
 
 #include <plat/serial.h>
 
@@ -27,3 +31,5 @@ component Mux {
         HARDWARE_SERIAL_CONFIG
     }
 }
+
+#endif /* VIRTIOSO_MUX_SEL4_MUX_CAMKES */

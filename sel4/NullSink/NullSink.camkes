@@ -3,9 +3,15 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#pragma once
+#ifndef VIRTIOSO_MUX_SEL4_NULLSINK_CAMKES
+#define VIRTIOSO_MUX_SEL4_NULLSINK_CAMKES
+
 
 import <Batch.idl4>;
 
 component NullSink {
     provides Batch raw_batch;
 }
+
+#endif /* VIRTIOSO_MUX_SEL4_NULLSINK_CAMKES */

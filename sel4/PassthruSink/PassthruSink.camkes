@@ -3,6 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#pragma once
+#ifndef VIRTIOSO_MUX_SEL4_PASSTHRUSINK_CAMKES
+#define VIRTIOSO_MUX_SEL4_PASSTHRUSINK_CAMKES
+
 
 import <GetChar.idl4>;
 import <PutChar.idl4>;
@@ -27,3 +31,5 @@ component PassthruSink {
         hw_serial.serial_attributes <- serial_attributes;
     }
 }
+
+#endif /* VIRTIOSO_MUX_SEL4_PASSTHRUSINK_CAMKES */
