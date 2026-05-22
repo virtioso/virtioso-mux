@@ -51,7 +51,8 @@ function(VirtiosoGenerateCAmkESStreamRegistry name camkes_config)
     set(stream_registry_includes
         "${CMAKE_CURRENT_LIST_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}"
-        "${VIRTIOSO_MUX_SOURCE_DIR}"
+        "${VIRTIOSO_CAMKES_VM_DIR}"
+        "${VIRTIOSO_MUX_SOURCE_DIR}/sel4"
         ${STREAM_REGISTRY_CPP_INCLUDES}
         "${CAMKES_VM_DIR}/components/VM"
         "${CAMKES_VM_DIR}/components/VM/configurations"
