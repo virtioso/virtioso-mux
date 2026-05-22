@@ -25,8 +25,8 @@ Related notes:
 
 Reference implementation:
 
-- [`sources/tcu_muxer/uart-proto.h`](/home/hlyytine/tii-sel4/sources/tcu_muxer/uart-proto.h:27)
-- [`sources/tcu_muxer/tcu_com.c`](/home/hlyytine/tii-sel4/sources/tcu_muxer/tcu_com.c:696)
+- `sources/tcu_muxer/uart-proto.h`
+- `sources/tcu_muxer/tcu_com.c`
 
 ## Summary
 
@@ -84,24 +84,24 @@ Current x86 `vm_qemu_virtio` work already established the right stream model:
 
 Verified implementation pieces:
 
-- [`tools/qemu_runner.py`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/tools/qemu_runner.py:593)
+- `tools/qemu_runner.py`
   declares the logical stream IDs used by the host runtime.
-- [`apps/x86/vm_qemu_virtio/vm_qemu_virtio.camkes`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/apps/x86/vm_qemu_virtio/vm_qemu_virtio.camkes:88)
+- `apps/x86/vm_qemu_virtio/vm_qemu_virtio.camkes`
   previously hard-coded target-side stream IDs for VM0 console, VM1 console,
   and VMM/infra diagnostics. These app assignments are now migration history,
   not the target contract.
-- [`components/GuestConsoleSink/src/guest_console_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/GuestConsoleSink/src/guest_console_sink.c:68)
+- `components/GuestConsoleSink/src/guest_console_sink.c`
   now prefixes non-empty batches with `0xfe <generated-stream-id>`, escapes
   literal payload `0xfe` bytes as `0xfe 0xfe`, gets the stream ID from
   generated CAmkES identity, and flushes on newline, carriage return, prompt
   colon, or threshold.
-- [`components/ConsolePassthroughSink/src/console_passthrough_sink.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsolePassthroughSink/src/console_passthrough_sink.c:111)
+- `components/ConsolePassthroughSink/src/console_passthrough_sink.c`
   is the raw batch-to-physical-serial sink.
-- [`components/ConsoleMux/src/console_mux.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/components/ConsoleMux/src/console_mux.c:42)
+- `components/ConsoleMux/src/console_mux.c`
   exists in the minimal x86 path and forwards batched bytes to an uplink, but
   its optional report path now uses generated CAmkES identity and suppresses
   reports when the mux itself has no valid stream.
-- [`tools/console_router.py`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/tools/console_router.py:122)
+- `tools/console_router.py`
   no longer carries the old `CF`, JSONL, binary-frame, or `line_prefixes`
   compatibility paths. Until the real demuxer lands, the host runner uses a
   single `process_stdio` channel.
@@ -125,11 +125,11 @@ Current Orin AGX `vm_qemu_virtio` console wiring is not the same as x86:
 
 - VM0 Linux uses NVIDIA TCU as `/serial` with `console=ttyTCU0`.
 - The TCU node is generated in
-  [`src/plat/orinagx/fdt.c`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/src/plat/orinagx/fdt.c:122)
+  `src/plat/orinagx/fdt.c`
   only when the HSP nodes needed by the TCU mailbox path are present.
 - VM0 passes HSP Top0/AON, GPIO, SDMMC4, MGBE, SMMU, BPMP-related nodes, and
   TCU-related IRQs to Linux in
-  [`apps/Arm/vm_qemu_virtio/orinagx/devices.camkes`](/home/hlyytine/tii-sel4/projects/virtioso-camkes-vm/apps/Arm/vm_qemu_virtio/orinagx/devices.camkes:72).
+  `apps/Arm/vm_qemu_virtio/orinagx/devices.camkes`.
 - VM1 Linux currently uses UARTI passthrough at `/bus@0/serial@31d0000` with
   `console=ttyAMA0,115200n8`; its `dtb_irqs` includes INTID `317`, UARTI SPI
   `285`.
