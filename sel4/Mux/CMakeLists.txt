@@ -6,7 +6,7 @@
 
 cmake_minimum_required(VERSION 3.8.2)
 
-project(ConsoleMux C)
+project(Mux C)
 
 set(CONSOLE_MUX_SOURCES src/console_mux.c)
 set(CONSOLE_MUX_INCLUDES)
@@ -29,7 +29,7 @@ if(DEFINED VIRTIO_CAMKES_STREAM_REGISTRY_HEADER)
 endif()
 
 DeclareCAmkESComponent(
-    ConsoleMux
+    Mux
     SOURCES
     ${CONSOLE_MUX_SOURCES}
     INCLUDES

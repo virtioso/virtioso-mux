@@ -6,10 +6,10 @@
 
 cmake_minimum_required(VERSION 3.8.2)
 
-project(ConsolePassthroughSink C)
+project(PassthruSink C)
 
 DeclareCAmkESComponent(
-    ConsolePassthroughSink
+    PassthruSink
     SOURCES
     src/console_passthrough_sink.c
 )

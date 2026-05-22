@@ -6,10 +6,10 @@
 
 cmake_minimum_required(VERSION 3.8.2)
 
-project(GuestConsoleSink C)
+project(GuestSink C)
 
 DeclareCAmkESComponent(
-    GuestConsoleSink
+    GuestSink
     SOURCES
     src/guest_console_sink.c
 )

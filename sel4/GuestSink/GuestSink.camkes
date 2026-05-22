@@ -7,7 +7,7 @@
 import <PutChar.idl4>;
 import <Batch.idl4>;
 
-component GuestConsoleSink {
+component GuestSink {
     provides PutChar guest_putchar;
     uses Batch mux_batch;
 }

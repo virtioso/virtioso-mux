@@ -11,7 +11,7 @@ import <GetChar.idl4>;
 import <Batch.idl4>;
 import <serial.camkes>;
 
-component ConsoleMux {
+component Mux {
     provides Batch mux_batch;
     provides GetChar vm0_getchar;
     provides GetChar vm1_getchar;

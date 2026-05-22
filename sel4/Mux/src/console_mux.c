@@ -217,7 +217,7 @@ static int console_mux_enqueue_stream_byte(int stream_id, uint8_t byte)
     if (sink == NULL || sink->buf == NULL || sink->emit == NULL) {
         console_mux_downlink_stats.missing_sink_bytes++;
         if (console_mux_is_power_of_two(console_mux_downlink_stats.missing_sink_bytes)) {
-            ZF_LOGW("ConsoleMux dropped downlink byte: missing sink stream=%d count=%llu",
+            ZF_LOGW("Mux dropped downlink byte: missing sink stream=%d count=%llu",
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
         }
@@ -228,7 +228,7 @@ static int console_mux_enqueue_stream_byte(int stream_id, uint8_t byte)
     if (rx == NULL) {
         console_mux_downlink_stats.missing_sink_bytes++;
         if (console_mux_is_power_of_two(console_mux_downlink_stats.missing_sink_bytes)) {
-            ZF_LOGW("ConsoleMux dropped downlink byte: null sink buffer stream=%d count=%llu",
+            ZF_LOGW("Mux dropped downlink byte: null sink buffer stream=%d count=%llu",
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.missing_sink_bytes);
         }
@@ -239,7 +239,7 @@ static int console_mux_enqueue_stream_byte(int stream_id, uint8_t byte)
     if (next_tail == rx->head) {
         console_mux_downlink_stats.ring_full_bytes++;
         if (console_mux_is_power_of_two(console_mux_downlink_stats.ring_full_bytes)) {
-            ZF_LOGW("ConsoleMux dropped downlink byte: sink ring full stream=%d count=%llu",
+            ZF_LOGW("Mux dropped downlink byte: sink ring full stream=%d count=%llu",
                     stream_id,
                     (unsigned long long)console_mux_downlink_stats.ring_full_bytes);
         }
@@ -294,7 +294,7 @@ static void console_mux_feed_downlink_byte(uint8_t byte)
             console_mux_rx_stream = -1;
             console_mux_downlink_stats.unknown_stream_bytes++;
             if (console_mux_is_power_of_two(console_mux_downlink_stats.unknown_stream_bytes)) {
-                ZF_LOGW("ConsoleMux saw unknown downlink stream id=%u count=%llu",
+                ZF_LOGW("Mux saw unknown downlink stream id=%u count=%llu",
                         byte,
                         (unsigned long long)console_mux_downlink_stats.unknown_stream_bytes);
             }
@@ -344,20 +344,20 @@ void serial_dev_irq_handle(ps_irq_t *irq)
 {
     console_mux_handle_uart_irq();
     int err = serial_dev_irq_acknowledge(irq);
-    ZF_LOGE_IF(err != 0, "ConsoleMux failed to acknowledge UARTI IRQ");
+    ZF_LOGE_IF(err != 0, "Mux failed to acknowledge UARTI IRQ");
 }
 
 void pre_init(void)
 {
     int err = camkes_io_ops(&console_mux_io_ops);
-    ZF_LOGF_IF(err != 0, "ConsoleMux failed to initialise IO ops");
+    ZF_LOGF_IF(err != 0, "Mux failed to initialise IO ops");
 
     console_mux_serial = ps_cdev_init(
         PS_SERIAL_DEFAULT,
         &console_mux_io_ops,
         &console_mux_serial_device
     );
-    ZF_LOGF_IF(console_mux_serial == NULL, "ConsoleMux failed to initialise UARTI");
+    ZF_LOGF_IF(console_mux_serial == NULL, "Mux failed to initialise UARTI");
 
     console_mux_serial->flags &= ~SERIAL_AUTO_CR;
 }

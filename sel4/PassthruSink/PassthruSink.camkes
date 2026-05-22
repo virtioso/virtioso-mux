@@ -9,7 +9,7 @@ import <PutChar.idl4>;
 import <Batch.idl4>;
 import <serial.camkes>;
 
-component ConsolePassthroughSink {
+component PassthruSink {
     control;
     provides PutChar processed_putchar;
     provides PutChar raw_putchar;

@@ -6,10 +6,10 @@
 
 cmake_minimum_required(VERSION 3.8.2)
 
-project(ConsoleNullBatchSink C)
+project(NullSink C)
 
 DeclareCAmkESComponent(
-    ConsoleNullBatchSink
+    NullSink
     SOURCES
     src/console_null_batch_sink.c
 )

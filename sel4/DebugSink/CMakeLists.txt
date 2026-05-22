@@ -6,10 +6,10 @@
 
 cmake_minimum_required(VERSION 3.8.2)
 
-project(ConsoleDebugBatchSink C)
+project(DebugSink C)
 
 DeclareCAmkESComponent(
-    ConsoleDebugBatchSink
+    DebugSink
     SOURCES
     src/console_debug_batch_sink.c
 )

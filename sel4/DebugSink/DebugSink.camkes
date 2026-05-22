@@ -6,6 +6,6 @@
 
 import <Batch.idl4>;
 
-component ConsoleNullBatchSink {
+component DebugSink {
     provides Batch raw_batch;
 }
