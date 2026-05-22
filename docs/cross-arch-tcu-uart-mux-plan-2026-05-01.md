@@ -21,8 +21,8 @@ Related notes:
 
 Reference implementation:
 
-- `sources/tcu_muxer/uart-proto.h`
-- `sources/tcu_muxer/tcu_com.c`
+- `sources/virtioso-mux/host/uart-proto.h`
+- `sources/virtioso-mux/host/tcu_com.c`
 
 ## Summary
 
@@ -282,11 +282,11 @@ The forked demuxer must support two upstream UART shapes:
   our `0xfe` mux rules.
 - NVIDIA `vcmuxer` is not present. In this mode, our demuxer must also do
   the direct input/output work NVIDIA `vcmuxer` normally performs, following
-  the behavior in `sources/tcu_muxer/tcu_com.c`, while still using `0xfe` for
+  the behavior in `sources/virtioso-mux/host/tcu_com.c`, while still using `0xfe` for
   our nested stream switching.
 
 Initial implementation:
-`sources/tcu_muxer` now has a Virtioso mode selected by
+`sources/virtioso-mux/host` now has a Virtioso mode selected by
 `-V <console-stream-registry.json>`. In that mode, NVIDIA `0xff` TCU handling
 stays an outer protocol selected with `-O nvidia-tcu -C <tag>`, while
 `-O raw` treats input as an already-selected Virtioso byte stream. The inner
@@ -302,7 +302,7 @@ Affected areas:
 
 - `tools/console_router.py` or its replacement
 - possible new `tools/tcu_console_router.py` or a small adapter around
-  `sources/tcu_muxer`
+  `sources/virtioso-mux/host`
 - mux startup/reset behavior
 - generated runtime registry table
 - PTY and log directory creation
@@ -677,7 +677,7 @@ the mux/demux work hostage.
 Initial implementation:
 `tools/console_router.py` now supports `transport.type = "virtioso_tcu_mux"`.
 For `vm_qemu_virtio` profiles, `tools/qemu_runner.py` writes a local runner
-manifest that starts `sources/tcu_muxer/vcmuxer -A` and records dynamic
+manifest that starts `sources/virtioso-mux/host/virtioso-mux -A` and records dynamic
 PTY/log sessions from stream announcements. Remote bundles deliberately keep
 their inner manifest as `process_stdio`; the local runner-side router demuxes
 the SSH stream so we do not run two demuxers in series.
