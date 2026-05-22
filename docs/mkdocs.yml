@@ -1,0 +1,7 @@
+site_name: Virtioso Mux
+docs_dir: .
+nav:
+  - Overview: virtual-channel-mux-architecture.md
+  - Wire Protocol: virtioso-mux-wire-protocol.md
+  - Cross-Arch Plan: cross-arch-tcu-uart-mux-plan-2026-05-01.md
+  - Orin UARTI Plan: orin-uarti-mux-carrier-plan-2026-05-03.md
