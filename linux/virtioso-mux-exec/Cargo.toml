@@ -1,0 +1,14 @@
+[package]
+name = "virtioso-mux-exec"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[[bin]]
+name = "virtioso-mux-exec"
+path = "src/main.rs"
+
+[dependencies]
+virtioso-mux-proto = { path = "../virtioso-mux-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+clap = { version = "4", features = ["derive"] }

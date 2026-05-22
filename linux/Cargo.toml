@@ -1,0 +1,3 @@
+[workspace]
+members = ["virtioso-mux-proto", "virtioso-muxd", "virtioso-mux-exec"]
+resolver = "2"
