@@ -9,11 +9,11 @@ CFLAGS += -Wno-missing-field-initializers
 CEXTRA = -pthread -std=gnu99
 SOURCES = tcu_com.c
 
-all: vcmuxer
+all: virtioso-mux
 
-vcmuxer: tcu_com.c
-	$(CC) $(CFLAGS) $(CEXTRA) tcu_com.c -o vcmuxer
+virtioso-mux: tcu_com.c
+	$(CC) $(CFLAGS) $(CEXTRA) tcu_com.c -o virtioso-mux
 
 clean:
 	rm -f *.o
-	rm -f vcmuxer
+	rm -f virtioso-mux
