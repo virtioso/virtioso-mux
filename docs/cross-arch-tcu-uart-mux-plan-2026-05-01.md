@@ -16,8 +16,8 @@ not block finishing the Orin CAmkES component mux/demux path.
 
 Related notes:
 
-- [../integration/orinagx-vm-qemu-virtio-crossvm-irq-analysis-2026-02-09.md](../integration/orinagx-vm-qemu-virtio-crossvm-irq-analysis-2026-02-09.md)
-- [../platforms/orin-agx/investigations/tcu-console-sporadic-hang.md](../platforms/orin-agx/investigations/tcu-console-sporadic-hang.md)
+- [Cross-VM IRQ analysis (Orin AGX)](../virtioso-camkes-vm/integration/orinagx-vm-qemu-virtio-crossvm-irq-analysis-2026-02-09.md)
+- [TCU console sporadic hang investigation](../virtioso-camkes-vm/platforms/orin-agx/investigations/tcu-console-sporadic-hang.md)
 
 Reference implementation:
 
